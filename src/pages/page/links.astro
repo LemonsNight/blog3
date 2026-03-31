@@ -1,0 +1,23 @@
+---
+import BlogPage from "../../layouts/BlogPage.astro";
+import Friend from "../../components/friend/Friend.astro";
+import FriendList from "../../components/friend/FriendList.astro";
+import FriendCategoryTitle from "../../components/friend/FriendCategoryTitle.astro";
+import MarkdownBody from "../../components/MarkdownBody.astro";
+import Giscus from "../../components/Giscus.astro";
+
+import * as markdownData from "./_links.md";
+---
+
+<BlogPage title="链接" description="来看看我的小伙伴们吧！">
+    <FriendCategoryTitle>链接分类</FriendCategoryTitle>
+    <FriendList>
+        <Friend name="赛马娘赛道模拟" description="日服的赛道技能测试" url="https://mee1080.github.io/umasim/race/" avatarUrl="https://ts1.tc.mm.bing.net/th/id/OIP-C.STLjGynesZLeXWWVbV8vrgHaKe?w=108&h=108&c=1&bgcl=b0c5b9&r=0&o=7&dpr=1.5&pid=ImgRC&rm=3"></Friend>
+        <Friend url="https://www.umafriends.com/" name="马娘友人帐" description="种马DB" avatarUrl="https://ts4.tc.mm.bing.net/th/id/OIP-C.S9Lqi5gHwwWqEl5lo1wHDQHaNJ?w=128&h=108&c=7&qlt=90&bgcl=b6f829&r=0&o=6&dpr=1.5&pid=13.1" />
+        <Friend url="https://lemonsnight.github.io/uma-factor-calculator" name="赛马娘因子计算器" description="Uma Musume Factor Calculator" avatarUrl="https://ts1.tc.mm.bing.net/th/id/OIP-C.RfWYnybXYI9JZ2TDROlTlgAAAA?w=108&h=108&c=1&bgcl=db65e4&r=0&o=7&dpr=1.5&pid=ImgRC&rm=3" />
+    </FriendList>
+    <MarkdownBody class="mt-6">
+        <markdownData.Content />
+    </MarkdownBody>
+    <Giscus slot="comment" />
+</BlogPage>

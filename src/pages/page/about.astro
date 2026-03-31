@@ -1,0 +1,17 @@
+---
+import Layout from '../../layouts/BlogPage.astro';
+import MarkdownBody from "../../components/MarkdownBody.astro";
+import Giscus from "../../components/Giscus.astro";
+
+import * as markdownData from "./_about.md";
+---
+
+<Layout
+	title="关于"
+	description=""
+>
+	<MarkdownBody class="mt-6">
+		<markdownData.Content />
+	</MarkdownBody>
+	<Giscus slot="comment" />
+</Layout>
