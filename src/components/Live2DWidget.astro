@@ -1,0 +1,28 @@
+---
+// Live2D 看板娘组件
+// 文档：https://github.com/stevenjoezhang/live2d-widget
+---
+
+<!-- Live2D Widget -->
+<script src="https://fastly.jsdelivr.net/npm/live2d-widgets@1.0.0/dist/autoload.js"></script>
+
+<style is:global>
+  /* 移动端隐藏看板娘，避免影响阅读 */
+  @media (max-width: 768px) {
+    .waifu {
+      display: none !important;
+    }
+  }
+  
+  /* 调整看板娘位置 - 左下角 */
+  .waifu {
+    bottom: -10px !important;
+    left: 10px !important;
+  }
+  
+  /* 调整工具栏位置 */
+  .waifu-tips {
+    bottom: 80px !important;
+    left: 50px !important;
+  }
+</style>
