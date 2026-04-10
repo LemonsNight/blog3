@@ -1,0 +1,691 @@
+---
+title: '手把手教你编写 GitHub Actions 部署配置文件'
+description: '从零开始学习如何编写 deploy.yml，详解 GitHub Actions 工作流配置的每个部分'
+pubDate: '2026-04-10'
+heroImage: '/blog-placeholder-2.jpg'
+---
+
+## 前言
+
+在使用 GitHub Pages 托管静态网站时，手动构建和部署既繁琐又容易出错。GitHub Actions 可以帮我们自动化这个过程，而核心就是编写一个 `deploy.yml` 配置文件。
+
+本文将带你从零开始，逐行解析如何编写一个完整的部署配置文件。
+
+---
+
+## 什么是 deploy.yml？
+
+`deploy.yml` 是 GitHub Actions 的工作流配置文件，位于 `.github/workflows/` 目录下。它告诉 GitHub：
+
+- **何时**触发自动化任务（例如：推送代码时）
+- **做什么**（例如：安装依赖、构建项目、部署到服务器）
+- **怎么做**（使用什么工具、什么环境）
+
+---
+
+## 完整配置示例
+
+先来看一个完整的 Astro 博客部署配置：
+
+```yaml
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your repository using git
+        uses: actions/checkout@v4
+      - name: Install, build, and upload your site output
+        uses: withastro/action@v2
+        with:
+          node-version: 24
+          package-manager: pnpm@latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+接下来，我们逐段解析这个配置文件的每个部分。
+
+---
+
+## 1. 工作流名称
+
+```yaml
+name: Deploy to GitHub Pages
+```
+
+**作用**：给工作流起一个名字，显示在 GitHub Actions 页面中。
+
+**建议**：
+- 使用简洁明了的名称
+- 体现工作流的用途
+- 例如："CI Pipeline"、"Deploy to Production"
+
+---
+
+## 2. 触发条件（on）
+
+```yaml
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+```
+
+**作用**：定义什么情况下触发这个工作流。
+
+### 2.1 push 触发
+
+```yaml
+push:
+  branches: [master]
+```
+
+当推送到 `master` 分支时自动触发。
+
+**常见配置**：
+```yaml
+# 监听多个分支
+push:
+  branches: [main, master]
+
+# 排除某些分支
+push:
+  branches:
+    - main
+    - '!dev'  # 排除 dev 分支
+
+# 监听特定路径的文件变化
+push:
+  branches: [main]
+  paths:
+    - 'src/**'
+    - 'package.json'
+```
+
+### 2.2 手动触发
+
+```yaml
+workflow_dispatch:
+```
+
+允许在 GitHub 页面上手动点击按钮触发工作流。
+
+**适用场景**：
+- 临时重新部署
+- 测试部署流程
+- 紧急修复
+
+### 2.3 其他触发方式
+
+```yaml
+# 定时触发（每天凌晨 2 点）
+schedule:
+  - cron: '0 2 * * *'
+
+# Pull Request 触发
+pull_request:
+  branches: [main]
+
+# 标签推送触发
+push:
+  tags:
+    - 'v*'
+```
+
+---
+
+## 3. 权限配置（permissions）
+
+```yaml
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+```
+
+**作用**：定义工作流需要的权限，遵循最小权限原则。
+
+### 权限说明
+
+| 权限 | 作用 | 是否必需 |
+|------|------|----------|
+| `contents: read` | 读取仓库代码 | ✅ 必需 |
+| `pages: write` | 部署到 GitHub Pages | ✅ 必需 |
+| `id-token: write` | 生成 OIDC token，用于安全认证 | ✅ 必需 |
+
+**为什么需要这些权限？**
+- `contents: read`：检出代码需要读取权限
+- `pages: write`：部署到 Pages 需要写入权限
+- `id-token: write`：GitHub Pages 使用 OIDC 进行身份验证，确保部署安全
+
+**安全提示**：
+- 只授予必需的权限
+- 避免使用 `permissions: write-all`
+- 定期审查权限配置
+
+---
+
+## 4. 任务（jobs）
+
+```yaml
+jobs:
+  build:
+    # ...
+  deploy:
+    # ...
+```
+
+**作用**：定义工作流中的各个任务。
+
+### 4.1 任务结构
+
+每个任务包含：
+- **runs-on**：运行环境
+- **steps**：执行步骤
+- **needs**：依赖关系（可选）
+- **environment**：部署环境（可选）
+
+### 4.2 为什么分成两个任务？
+
+```yaml
+jobs:
+  build:    # 构建任务
+    # ...
+  
+  deploy:   # 部署任务
+    needs: build  # 依赖 build 任务
+    # ...
+```
+
+**原因**：
+1. **职责分离**：构建和部署是两个不同的阶段
+2. **并行优化**：未来可以并行执行其他任务
+3. **失败隔离**：构建失败不会影响其他任务
+4. **清晰可见**：在 Actions 页面可以清楚看到每个阶段的状态
+
+---
+
+## 5. 构建任务（build）
+
+```yaml
+build:
+  runs-on: ubuntu-latest
+  steps:
+    - name: Checkout your repository using git
+      uses: actions/checkout@v4
+    - name: Install, build, and upload your site output
+      uses: withastro/action@v2
+      with:
+        node-version: 24
+        package-manager: pnpm@latest
+```
+
+### 5.1 运行环境
+
+```yaml
+runs-on: ubuntu-latest
+```
+
+**作用**：指定任务运行的操作系统。
+
+**可选值**：
+- `ubuntu-latest`：最新的 Ubuntu LTS（推荐）
+- `windows-latest`：最新的 Windows Server
+- `macos-latest`：最新的 macOS
+
+**选择建议**：
+- 静态网站：使用 `ubuntu-latest`（速度快、成本低）
+- Windows 专属应用：使用 `windows-latest`
+- iOS 应用：使用 `macos-latest`
+
+### 5.2 步骤（steps）
+
+#### 步骤1：检出代码
+
+```yaml
+- name: Checkout your repository using git
+  uses: actions/checkout@v4
+```
+
+**作用**：将仓库代码下载到运行环境中。
+
+**参数说明**：
+- `name`：步骤名称，显示在日志中
+- `uses`：使用的 Action，格式为 `owner/repo@version`
+- `actions/checkout@v4`：GitHub 官方的检出 Action
+
+**高级用法**：
+```yaml
+# 检出特定分支
+- uses: actions/checkout@v4
+  with:
+    ref: develop
+
+# 检出子模块
+- uses: actions/checkout@v4
+  with:
+    submodules: true
+
+# 获取完整历史记录
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+```
+
+#### 步骤2：构建并上传
+
+```yaml
+- name: Install, build, and upload your site output
+  uses: withastro/action@v2
+  with:
+    node-version: 24
+    package-manager: pnpm@latest
+```
+
+**作用**：这是 Astro 官方提供的 Action，自动完成以下操作：
+1. 安装 Node.js
+2. 安装依赖（使用指定的包管理器）
+3. 构建项目
+4. 上传构建产物（供部署任务使用）
+
+**参数说明**：
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `node-version` | Node.js 版本 | `18`、`20`、`24` |
+| `package-manager` | 包管理器 | `pnpm@latest`、`npm`、`yarn` |
+| `path` | 项目根目录（可选） | `./my-app` |
+
+**为什么使用官方 Action？**
+- ✅ 简化配置，无需手动写安装和构建命令
+- ✅ 自动处理缓存，加速后续构建
+- ✅ 与 GitHub Pages 完美集成
+- ✅ 定期更新，保持最佳实践
+
+**如果不使用官方 Action，需要手动配置**：
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  
+  # 设置 Node.js
+  - name: Setup Node.js
+    uses: actions/setup-node@v4
+    with:
+      node-version: 24
+      
+  # 安装 pnpm
+  - name: Install pnpm
+    run: npm install -g pnpm
+    
+  # 缓存依赖
+  - name: Cache pnpm store
+    uses: actions/cache@v4
+    with:
+      path: ~/.local/share/pnpm/store
+      key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+      
+  # 安装依赖
+  - name: Install dependencies
+    run: pnpm install
+    
+  # 构建项目
+  - name: Build project
+    run: pnpm build
+    
+  # 上传构建产物
+  - name: Upload artifact
+    uses: actions/upload-pages-artifact@v3
+    with:
+      path: ./dist
+```
+
+可以看到，使用官方 Action 大大简化了配置！
+
+---
+
+## 6. 部署任务（deploy）
+
+```yaml
+deploy:
+  needs: build
+  runs-on: ubuntu-latest
+  environment:
+    name: github-pages
+    url: ${{ steps.deployment.outputs.page_url }}
+  steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
+```
+
+### 6.1 依赖关系
+
+```yaml
+needs: build
+```
+
+**作用**：声明此任务依赖于 `build` 任务。
+
+**执行顺序**：
+```
+build 任务 → 成功后 → deploy 任务
+```
+
+如果 `build` 失败，`deploy` 不会执行。
+
+**多依赖示例**：
+```yaml
+deploy:
+  needs: [build, test, lint]  # 依赖多个任务
+```
+
+### 6.2 环境配置
+
+```yaml
+environment:
+  name: github-pages
+  url: ${{ steps.deployment.outputs.page_url }}
+```
+
+**作用**：配置部署环境，用于：
+- 显示部署状态
+- 提供访问链接
+- 支持环境保护规则（如审批流程）
+
+**参数说明**：
+- `name`：环境名称，固定为 `github-pages`
+- `url`：部署后的访问地址，从 `deployment` 步骤的输出中获取
+
+### 6.3 部署步骤
+
+```yaml
+steps:
+  - name: Deploy to GitHub Pages
+    id: deployment
+    uses: actions/deploy-pages@v4
+```
+
+**作用**：将构建产物部署到 GitHub Pages。
+
+**参数说明**：
+- `id: deployment`：步骤 ID，用于引用输出值
+- `uses: actions/deploy-pages@v4`：GitHub 官方的部署 Action
+
+**工作原理**：
+1. 自动下载 `build` 任务上传的构建产物
+2. 将文件部署到 GitHub Pages
+3. 输出部署后的 URL
+
+---
+
+## 7. 变量和表达式
+
+在配置文件中，经常看到 `${{ }}` 语法，这是 GitHub Actions 的表达式语法。
+
+### 7.1 上下文对象
+
+```yaml
+${{ github.ref }}        # 当前分支或标签
+${{ github.event_name }} # 触发事件名称
+${{ runner.os }}         # 操作系统
+${{ secrets.API_KEY }}   # 加密的密钥
+```
+
+### 7.2 步骤输出
+
+```yaml
+url: ${{ steps.deployment.outputs.page_url }}
+```
+
+引用 `deployment` 步骤输出的 `page_url` 值。
+
+### 7.3 条件判断
+
+```yaml
+steps:
+  - name: Deploy to production
+    if: github.ref == 'refs/heads/main'
+    run: echo "Deploying to production"
+```
+
+---
+
+## 8. 常见配置模式
+
+### 8.1 多环境部署
+
+```yaml
+jobs:
+  deploy-staging:
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    # ...
+    
+  deploy-production:
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    # ...
+```
+
+### 8.2 矩阵构建
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 24]
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+```
+
+### 8.3 缓存优化
+
+```yaml
+steps:
+  - name: Cache dependencies
+    uses: actions/cache@v4
+    with:
+      path: ~/.pnpm-store
+      key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+      restore-keys: |
+        ${{ runner.os }}-pnpm-
+```
+
+---
+
+## 9. 调试技巧
+
+### 9.1 查看日志
+
+1. 进入仓库的 **Actions** 标签页
+2. 点击最近的工作流运行
+3. 展开各个步骤查看详细日志
+
+### 9.2 启用调试日志
+
+在仓库设置中添加 secret：
+- Name: `ACTIONS_STEP_DEBUG`
+- Value: `true`
+
+### 9.3 本地测试
+
+使用 [act](https://github.com/nektos/act) 工具在本地运行工作流：
+
+```bash
+# 安装 act
+brew install act
+
+# 运行工作流
+act push
+```
+
+---
+
+## 10. 最佳实践
+
+### ✅ 推荐做法
+
+1. **使用具体的版本号**
+   ```yaml
+   uses: actions/checkout@v4  # ✅ 好
+   uses: actions/checkout@main # ❌ 不好
+   ```
+
+2. **最小权限原则**
+   ```yaml
+   permissions:
+     contents: read
+     pages: write
+   ```
+
+3. **添加超时限制**
+   ```yaml
+   jobs:
+     build:
+       timeout-minutes: 30
+   ```
+
+4. **使用环境变量**
+   ```yaml
+   env:
+     NODE_ENV: production
+   ```
+
+5. **定期更新 Action 版本**
+   - 关注 GitHub 的安全公告
+   - 使用 Dependabot 自动更新
+
+### ❌ 避免的做法
+
+1. **硬编码敏感信息**
+   ```yaml
+   # ❌ 错误
+   run: echo "password=123456"
+   
+   # ✅ 正确
+   run: echo "password=${{ secrets.PASSWORD }}"
+   ```
+
+2. **使用过时的 Action 版本**
+   ```yaml
+   # ❌ 过时
+   uses: actions/checkout@v2
+   
+   # ✅ 最新
+   uses: actions/checkout@v4
+   ```
+
+3. **忽略错误处理**
+   ```yaml
+   # 添加 continue-on-error 时需要谨慎
+   - name: Optional step
+     continue-on-error: true
+     run: ./optional-script.sh
+   ```
+
+---
+
+## 11. 完整模板
+
+最后，提供一个通用的 Astro + GitHub Pages 部署模板：
+
+```yaml
+name: Deploy to GitHub Pages
+
+on:
+  # 推送到主分支时触发
+  push:
+    branches: [master]
+  # 允许手动触发
+  workflow_dispatch:
+
+# 权限配置
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 并发控制（可选）
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # 构建任务
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Build with Astro
+        uses: withastro/action@v2
+        with:
+          node-version: 24
+          package-manager: pnpm@latest
+
+  # 部署任务
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+---
+
+## 总结
+
+编写 `deploy.yml` 的核心要点：
+
+1. **理解结构**：name → on → permissions → jobs → steps
+2. **选择正确的触发条件**：push、workflow_dispatch 等
+3. **配置最小权限**：只授予必需的权限
+4. **使用官方 Action**：简化配置，提高可靠性
+5. **分离构建和部署**：清晰的职责划分
+6. **善用表达式**：动态配置，提高灵活性
+
+通过本文的学习，你应该能够：
+- ✅ 理解 deploy.yml 的每个配置项
+- ✅ 根据项目需求自定义配置
+- ✅ 排查常见的配置错误
+- ✅ 遵循最佳实践编写安全的配置
+
+---
+
+**相关资源**：
+- [GitHub Actions 官方文档](https://docs.github.com/en/actions)
+- [Astro 部署指南](https://docs.astro.build/en/guides/deploy/)
+- [Actions Marketplace](https://github.com/marketplace?type=actions)
+
+希望这篇文章能帮助你更好地理解和编写 GitHub Actions 配置文件！如果有问题，欢迎在评论区交流。
