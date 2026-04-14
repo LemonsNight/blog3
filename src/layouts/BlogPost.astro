@@ -7,17 +7,37 @@ import FormattedDate from '../components/FormattedDate.astro';
 import BaseLayout from "./BaseLayout.astro";
 import Container from "../components/Container.astro";
 import MarkdownBody from "../components/MarkdownBody.astro";
+import TableOfContents from '../components/TableOfContents.svelte';
 
-type Props = CollectionEntry<'blog'>['data'];
+type Props = CollectionEntry<'blog'>;
 
-const { title, description, pubDate, updatedDate, heroImage } = Astro.props;
+const post = Astro.props;
+const { title, description, pubDate, updatedDate, heroImage } = post.data;
+
+// 从文章内容中提取 H2 和 H3 标题
+const headings: Array<{ id: string; text: string; level: number }> = [];
+if (post.body) {
+	const headingRegex = /^(##|###)\s+(.+)$/gm;
+	let match;
+	while ((match = headingRegex.exec(post.body)) !== null) {
+		const level = match[1] === '##' ? 2 : 3;
+		const text = match[2].trim();
+		// 生成 ID：将文本转换为小写，替换空格为连字符，移除非字母数字字符
+		const id = text
+			.toLowerCase()
+			.replace(/\s+/g, '-')
+			.replace(/[^a-z0-9\u4e00-\u9fa5-]/g, '');
+		headings.push({ id, text, level });
+	}
+}
 ---
 
 <BaseLayout>
 	<BaseHead slot="head" title={title} description={description} image={heroImage} />
 	<Header />
 	<Container defaultPadding={true}>
-		<div class="mb-8">
+		<div class="mb-8 grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-8">
+			<!-- 文章主体 -->
 			<article class="text-black dark:text-white">
 				<h2 class="text-3xl font-bold leading-normal">{title}</h2>
 				<div class="mt-4">
@@ -28,6 +48,11 @@ const { title, description, pubDate, updatedDate, heroImage } = Astro.props;
 					<slot />
 				</MarkdownBody>
 			</article>
+			
+			<!-- 右侧目录导航 -->
+			<aside class="hidden lg:block">
+				<TableOfContents {headings} client:load />
+			</aside>
 		</div>
 		<slot name="comment" />
 	</Container>

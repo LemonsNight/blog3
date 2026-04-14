@@ -19,7 +19,34 @@ export default defineConfig({
     remarkRehype: {
       footnoteLabel: "脚注",
       footnoteBackLabel: '文档内容的脚注',
-    }
+    },
+    remarkPlugins: [
+      // 自动为标题添加 ID
+      () => {
+        return (tree) => {
+          const { visit } = require('unist-util-visit');
+          visit(tree, 'heading', (node) => {
+            let text = '';
+            if (node.children && node.children.length > 0) {
+              node.children.forEach((child) => {
+                if (child.type === 'text') {
+                  text += child.value;
+                }
+              });
+            }
+            if (text) {
+              const id = text
+                .toLowerCase()
+                .replace(/\s+/g, '-')
+                .replace(/[^\w\u4e00-\u9fa5-]/g, '');
+              if (!node.data) node.data = {};
+              if (!node.data.hProperties) node.data.hProperties = {};
+              node.data.hProperties.id = id;
+            }
+          });
+        };
+      }
+    ]
   },
 
   vite: {
