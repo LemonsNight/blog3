@@ -3,7 +3,7 @@
 // 自动生成 H2、H3 标题的目录，支持滚动高亮和点击跳转
 ---
 
-<script>
+<script lang="ts">
   import { onMount } from 'svelte';
   
   export let headings: Array<{ id: string; text: string; level: number }> = [];
