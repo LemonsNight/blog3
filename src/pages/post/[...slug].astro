@@ -20,7 +20,7 @@ const post = Astro.props;
 const { Content } = await render(post);
 ---
 
-<BlogPost {...post.data}>
+<BlogPost data={post.data} body={post.body}>
 	<Content />
 	<Giscus slot="comment" />
 </BlogPost>

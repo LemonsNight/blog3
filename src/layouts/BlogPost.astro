@@ -9,24 +9,39 @@ import Container from "../components/Container.astro";
 import MarkdownBody from "../components/MarkdownBody.astro";
 import TableOfContents from '../components/TableOfContents.svelte';
 
-type Props = CollectionEntry<'blog'>;
+interface Props {
+	data: CollectionEntry<'blog'>['data'];
+	body?: string;
+}
 
-const post = Astro.props;
-const { title, description, pubDate, updatedDate, heroImage } = post.data;
+const { data, body } = Astro.props;
+const { title, description, pubDate, updatedDate, heroImage } = data;
 
 // 从文章内容中提取 H2 和 H3 标题
 const headings: Array<{ id: string; text: string; level: number }> = [];
-if (post.body) {
-	const headingRegex = /^(##|###)\s+(.+)$/gm;
+const idCountMap = new Map<string, number>(); // 用于跟踪每个 ID 出现的次数
+
+if (body) {
+	const headingRegex = /^(#+)\s+(.*?)(?:\s*{#([a-zA-Z0-9_-]+)})?$/gm;
 	let match;
-	while ((match = headingRegex.exec(post.body)) !== null) {
-		const level = match[1] === '##' ? 2 : 3;
+	while ((match = headingRegex.exec(body)) !== null) {
+		const level = match[1].length;
 		const text = match[2].trim();
-		// 生成 ID：将文本转换为小写，替换空格为连字符，移除非字母数字字符
-		const id = text
-			.toLowerCase()
-			.replace(/\s+/g, '-')
-			.replace(/[^a-z0-9\u4e00-\u9fa5-]/g, '');
+		let id = match[3] || ''; // 尝试获取显式 ID
+
+		if (!id) {
+			// 生成基础 ID：将文本转换为小写，替换空格为连字符，移除非字母数字字符
+			let baseId = text
+				.toLowerCase()
+				.replace(/\s+/g, '-')
+				.replace(/[^a-z0-9\u4e00-\u9fa5-]/g, '');
+
+			// 如果 ID 已存在，添加序号
+			const count = idCountMap.get(baseId) || 0;
+			idCountMap.set(baseId, count + 1);
+			id = count > 0 ? `${baseId}-${count}` : baseId;
+		}
+		
 		headings.push({ id, text, level });
 	}
 }

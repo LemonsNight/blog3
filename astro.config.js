@@ -3,6 +3,7 @@ import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import svelte from "@astrojs/svelte";
 import tailwindcss from "@tailwindcss/vite";
+import { visit } from 'unist-util-visit';
 
 // https://astro.build/config
 export default defineConfig({
@@ -24,7 +25,8 @@ export default defineConfig({
       // 自动为标题添加 ID
       () => {
         return (tree) => {
-          const { visit } = require('unist-util-visit');
+          const idCountMap = new Map(); // 用于跟踪每个 ID 出现的次数
+          
           visit(tree, 'heading', (node) => {
             let text = '';
             if (node.children && node.children.length > 0) {
@@ -35,10 +37,17 @@ export default defineConfig({
               });
             }
             if (text) {
-              const id = text
+              // 生成基础 ID
+              const baseId = text
                 .toLowerCase()
                 .replace(/\s+/g, '-')
-                .replace(/[^\w\u4e00-\u9fa5-]/g, '');
+                .replace(/[^a-z0-9\u4e00-\u9fa5-]/g, '');
+              
+              // 如果 ID 已存在，添加序号
+              const count = idCountMap.get(baseId) || 0;
+              idCountMap.set(baseId, count + 1);
+              const id = count > 0 ? `${baseId}-${count}` : baseId;
+              
               if (!node.data) node.data = {};
               if (!node.data.hProperties) node.data.hProperties = {};
               node.data.hProperties.id = id;
