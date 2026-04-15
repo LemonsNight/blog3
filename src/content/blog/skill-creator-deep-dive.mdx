@@ -1,0 +1,335 @@
+---
+title: 'skill-creator 深度解析：如何用工程化手段打磨 Claude Code 技能'
+description: '拆解 skill-creator 的完整内部机制——草稿撰写、多 Agent 并发测评、量化基准、描述词自动优化循环，把技能开发从"靠感觉"变成可重复、可度量的工程流程'
+pubDate: '2026-04-15T23:00:00+08:00'
+heroImage: '/blog-placeholder-2.jpg'
+---
+
+## 引言
+
+写好一个 Claude Code Skill 比想象中难。
+
+你可能第一次就写出一个能用的 `SKILL.md`，但"能用"和"好用"之间有一道工程质量的鸿沟：技能该在什么时候被触发？触发太灵敏会干扰不相关的任务，触发太迟钝会让用户反复手动调用。技能给出的结果是否比不用技能更好？怎么量化？
+
+**skill-creator** 是一套内置于 Claude Code 的技能开发工具链，把技能开发的完整周期——草稿撰写、测试用例设计、多 Agent 并发评估、量化基准分析、描述词自动优化——串联成一个可重复的工程流程。
+
+本文逐层拆解它的工作原理。
+
+---
+
+## 一、为什么需要 skill-creator
+
+如果你只是写一个给自己用的简单技能，直接编辑 `SKILL.md` 就够了。skill-creator 的价值在另外三种场景：
+
+**场景一：要分发给他人的技能**
+技能一旦分发出去，你就没办法给每个用户解释"这个技能要这样用"。描述词（`description` 字段）必须精确到位，让 Claude 在正确的时机自动触发，在不相关的时机绝不误触。
+
+**场景二：行为比较复杂的技能**
+多步骤工作流、有条件分支的技能，执行效果很难靠"肉眼感觉"评估。你需要一套可重现的测试集，以及跨版本的对比机制。
+
+**场景三：持续迭代的团队技能**
+团队共享的技能随着项目演进需要更新。如何确保每次改动之后技能的整体质量没有退步？量化基准是唯一可靠的答案。
+
+---
+
+## 二、工程化流程全貌
+
+skill-creator 的核心是一个迭代循环：
+
+```
+草稿 → 测试用例 → 并发评估 → 量化基准 → 人工审查 → 改进 → 再评估
+```
+
+与一般的 LLM 评估框架不同，skill-creator 在每轮迭代中同时运行两组测试：
+
+- **with_skill**：使用当前技能版本执行任务
+- **without_skill / old_skill**：不使用技能，或使用上一版本
+
+这样每次迭代都有对照组，能看清楚改动带来的真实增量，而不是在自我感觉良好和自我怀疑之间摇摆。
+
+---
+
+## 三、目录结构与分工
+
+```
+~/.claude/skills/skill-creator/
+├── SKILL.md                      ← skill-creator 自身的入口指令
+├── agents/
+│   ├── grader.md                 ← 评分 Agent 指令
+│   ├── comparator.md             ← 盲测比较 Agent 指令
+│   └── analyzer.md               ← 结果分析 Agent 指令
+├── assets/
+│   └── eval_review.html          ← 评测 UI 模板
+├── eval-viewer/
+│   └── generate_review.py        ← 启动评测查看器
+├── references/
+│   └── schemas.md                ← evals.json / grading.json 等数据结构定义
+└── scripts/
+    ├── run_eval.py               ← 测试单个描述词的触发率
+    ├── run_loop.py               ← 自动迭代：评估 → 改进描述 → 再评估
+    ├── improve_description.py    ← 用 Claude 扩展思维改进描述词
+    ├── aggregate_benchmark.py    ← 聚合多次运行的统计数据
+    ├── package_skill.py          ← 打包为 .skill 文件
+    └── utils.py                  ← 公共工具函数
+```
+
+这个结构体现了一个设计原则：**将不同专业能力分配给不同的 Agent**。grader、comparator、analyzer 各司其职，避免单个 Agent 的上下文被多个复杂任务污染。
+
+---
+
+## 四、评估数据流
+
+### 4.1 测试用例格式
+
+测试用例存在 `evals/evals.json` 中：
+
+```json
+{
+  "skill_name": "my-skill",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我查一下 User 模块有哪些接口",
+      "expected_output": "列出 /api/basic/User 下的所有 CRUD 接口",
+      "assertions": [
+        {
+          "name": "使用了 curl.exe 而非 WebFetch",
+          "check": "输出中包含 curl.exe 命令"
+        },
+        {
+          "name": "输出格式为 method + path",
+          "check": "包含 GET / POST / PUT / DELETE 前缀"
+        }
+      ]
+    }
+  ]
+}
+```
+
+每个用例包含：prompt（用户会说什么）、expected_output（期望的结果描述）、assertions（可量化的检查项）。
+
+assertions 是关键——它把"感觉对不对"转化为"通过/失败"的布尔判断，这才能支撑统计分析。
+
+### 4.2 并发执行与工作区组织
+
+每轮迭代在 workspace 中创建如下结构：
+
+```
+my-skill-workspace/
+├── iteration-1/
+│   ├── eval-1/
+│   │   ├── with_skill/outputs/      ← 使用技能的执行结果
+│   │   ├── without_skill/outputs/   ← 无技能的执行结果
+│   │   ├── eval_metadata.json       ← 用例元数据 + assertions
+│   │   └── timing.json              ← token 用量和耗时
+│   ├── eval-2/
+│   │   └── ...
+│   ├── benchmark.json               ← 聚合后的统计数据
+│   └── benchmark.md                 ← 人类可读的基准报告
+```
+
+`timing.json` 记录了每次运行的 `total_tokens` 和 `duration_ms`，这是工程决策的重要参考——一个技能如果大幅增加了 token 消耗但效果提升有限，未必值得保留。
+
+### 4.3 评分机制
+
+grader Agent 读取 `agents/grader.md` 中的指令，对每个断言生成：
+
+```json
+{
+  "expectations": [
+    {
+      "text": "使用了 curl.exe 而非 WebFetch",
+      "passed": true,
+      "evidence": "输出中第 3 行包含 `curl.exe -L ...`"
+    }
+  ]
+}
+```
+
+注意字段名：`text`、`passed`、`evidence`——这三个字段名是硬性约定，eval-viewer 的渲染依赖它们。
+
+### 4.4 基准聚合
+
+```bash
+python -m scripts.aggregate_benchmark ./my-skill-workspace/iteration-1 \
+  --skill-name my-skill
+```
+
+输出的 `benchmark.json` 包含每个测试用例在 with_skill 和 without_skill 两个配置下的通过率、均值、标准差、以及两者的 delta 值。
+
+delta 是最有价值的数字：如果 with_skill 的通过率比 without_skill 高 30%，这个技能就值得保留；如果 delta 接近零，技能可能什么都没做。
+
+---
+
+## 五、可视化评测界面
+
+```bash
+python eval-viewer/generate_review.py \
+  ./my-skill-workspace/iteration-1 \
+  --skill-name "my-skill" \
+  --benchmark ./my-skill-workspace/iteration-1/benchmark.json
+```
+
+这会启动一个本地 HTTP 服务器，打开两个标签页：
+
+**Outputs 标签页**：逐条展示每个测试用例的执行结果，支持对比上一轮的输出，右侧有反馈输入框，提交后保存为 `feedback.json`。
+
+**Benchmark 标签页**：以表格形式展示量化指标，包含每个断言的通过率和 with/without 对比。
+
+反馈收集完成后，`feedback.json` 会成为下一轮改进的输入——skill-creator 读取其中每条人工评价，结合量化结果，决定 `SKILL.md` 需要在哪些方向改进。
+
+迭代第二轮时，加上 `--previous-workspace` 参数可以在 UI 中看到"上次输出 vs 本次输出"的直接对比，方便判断改动方向是否正确。
+
+---
+
+## 六、描述词自动优化循环
+
+触发精准度是技能工程中最难手工调优的部分。`run_loop.py` 把这个过程自动化：
+
+```bash
+python -m scripts.run_loop \
+  --eval-set trigger-evals.json \
+  --skill-path ~/.claude/skills/my-skill \
+  --model claude-sonnet-4-6 \
+  --max-iterations 5 \
+  --verbose
+```
+
+### 6.1 触发评估数据集格式
+
+```json
+[
+  {
+    "query": "帮我查一下 User 模块有哪些接口",
+    "should_trigger": true
+  },
+  {
+    "query": "帮我重构一下这个函数的逻辑",
+    "should_trigger": false
+  }
+]
+```
+
+should_trigger 为 true 的是"应该触发"的情况，false 是"不应该触发"的情况。**最有价值的 false 用例是接近误触的边缘情况**，比如和技能功能相关但实际不需要这个技能的请求。
+
+### 6.2 优化循环内部机制
+
+`run_loop.py` 的执行流程：
+
+1. **分割数据集**：60% 训练集 / 40% 测试集（防止过拟合）
+2. **评估当前描述**：对每个 query 运行 3 次取平均触发率（减少随机性）
+3. **扩展思维改进**：把失败用例传给 `improve_description.py`，用 Claude 的扩展思维模式生成候选描述
+4. **再评估**：对新描述在训练集上验证，选最优者
+5. **重复**：最多 5 轮，取测试集得分最高的版本
+
+最终输出 `best_description`，直接替换 `SKILL.md` 的 `description` 字段。
+
+训练集 / 测试集分割是防止过拟合的关键设计：如果只在训练集上优化，描述词可能只对这几个例子有效，换个说法就失效了。
+
+---
+
+## 七、盲测比较：更严格的 A/B 对比
+
+当你不确定新版本是否真的比旧版本好时，盲测比较能给出更可信的结论。
+
+```
+两个输出分别标记为 "版本 A" 和 "版本 B"
+↓
+comparator Agent 在不知道哪个是新版的情况下判断质量
+↓
+analyzer Agent 分析获胜原因，提炼改进方向
+```
+
+这套机制模拟了学术论文的同行评审：评审者不知道作者身份，减少偏见。对于面向团队分发的技能，这种严格程度是值得的。
+
+---
+
+## 八、打包与分发
+
+技能开发完成后，可以打包成 `.skill` 文件分发：
+
+```bash
+python -m scripts.package_skill ~/.claude/skills/my-skill
+```
+
+接收方解压后放到自己的 `~/.claude/skills/` 或项目的 `.claude/skills/` 目录，重启 Claude Code 即可生效。
+
+---
+
+## 九、一次完整的技能开发实录
+
+以开发 `read-swagger` 技能（从任意项目的 Swagger 文档读取接口定义）为例，走一遍完整流程：
+
+### 第一步：写初稿
+
+```markdown
+---
+name: read-swagger
+description: >
+  Read Swagger/OpenAPI documentation from any project using curl.exe on Windows.
+  Use this skill whenever the user wants to look up API endpoints, query interface
+  docs, check request/response models, or find API paths for a module.
+---
+
+## Step 1: Get the base URL
+...
+## Step 2: Discover swagger.json paths
+curl.exe -L "{baseUrl}/docs/index.html"
+...
+```
+
+### 第二步：设计测试用例
+
+选 3 个有代表性的场景：
+
+1. 用户提供了 URL，问某个模块有哪些接口
+2. 用户没提供 URL，询问如何获取
+3. 用户要查具体的请求参数和响应结构
+
+### 第三步：并发运行评估
+
+同一消息中启动 with_skill 和 without_skill 两组 Agent，让它们并行完成任务，结果分别存入各自的 `outputs/` 目录。
+
+### 第四步：撰写断言
+
+趁 Agent 运行时，把期望的行为量化成断言：
+
+- ✅ 输出包含 `curl.exe`，而非 `WebFetch`
+- ✅ 输出格式为 `METHOD /path` 形式
+- ✅ 没有凭空捏造接口路径
+
+### 第五步：查看评测界面，收集反馈
+
+打开 eval-viewer，逐条检查输出，对不满意的地方写下具体的问题描述。
+
+### 第六步：改进技能，进入下一轮迭代
+
+根据反馈更新 `SKILL.md`，进入 `iteration-2/`，再跑一遍。
+
+---
+
+## 十、值得关注的设计细节
+
+**描述词的"推动性"原则**：Claude 有天然的低触发倾向——倾向于直接回答而不是调用技能。skill-creator 的文档里明确指出，description 应该写得稍微"主动"一点，把触发场景描述得明确具体，而不是过于谦虚的一句话概括。
+
+**timing.json 的意义**：token 消耗是技能的隐性成本。如果一个技能每次执行都多消耗 10000 个 token，但效果只提升 10%，这个代价值不值得？timing.json 让这个问题有了量化答案。
+
+**测试集大小的工程选择**：skill-creator 的文档建议从 2-3 个测试用例开始，满意后再扩展到更大的测试集。过早追求大测试集会拖慢迭代速度；太小的测试集无法覆盖边缘情况。找到合适的规模是需要经验判断的工程决策。
+
+---
+
+## 结语
+
+skill-creator 把技能开发从"写完就用"变成了一个有明确质量门槛的工程流程。
+
+它的核心价值不是帮你写出更好的第一版——而是让每一次改进都有迹可循，让"这次改动有没有效果"有一个可重复验证的答案。
+
+对于只在自己机器上用的单次技能，直接写 `SKILL.md` 完全够用。但如果你在认真打造一个值得分发和长期维护的工程资产，skill-creator 提供的量化反馈循环是值得投入的。
+
+---
+
+## 参考资料
+
+- [Extend Claude with skills — 官方文档](https://code.claude.com/docs/en/skills)
+- [anthropics/skills — Anthropic 官方技能仓库](https://github.com/anthropics/skills)
+- [Claude Code Skills 深度解析：从原理到工程实践](/blog/claude-code-skills-deep-dive)
