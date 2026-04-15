@@ -1,0 +1,599 @@
+---
+title: '从 Claude Code 源码看生产级提示词工程：分层架构、缓存优化与差异化设计'
+description: '拆解 Claude Code 的 prompts.ts 源码，看 Anthropic 如何通过静动态边界分离、分段缓存、工具级模块化和双版本提示词，将提示词工程提升到工业生产级别'
+pubDate: '2026-04-15T20:00:00+08:00'
+heroImage: '/blog-placeholder-3.jpg'
+---
+
+## 引言
+
+提示词（Prompt）对大多数人来说是一段发给 AI 的文字，但在 Claude Code 的源码里，提示词工程已经被精心设计成一套有架构的工程体系——有缓存层、有模块化、有版本分支、有明确的性能预算。
+
+Claude Code 的源码来自 npm 包的 source map 还原，核心提示词逻辑集中在 `src/constants/prompts.ts`（600+ 行）和 `src/constants/systemPromptSections.ts` 中。本文逐层拆解这套设计，提炼可以迁移到其他 AI 应用的工程经验。
+
+---
+
+## 一、提示词的返回类型：为什么是数组而不是字符串
+
+第一个让人意外的设计是 `getSystemPrompt()` 的签名：
+
+```typescript
+// src/constants/prompts.ts
+export async function getSystemPrompt(
+  tools: Tools,
+  model: string,
+  additionalWorkingDirectories?: string[],
+  mcpClients?: MCPServerConnection[],
+): Promise<string[]>  // 注意：返回的是 string[]，而非 string
+```
+
+返回 `string[]` 而不是单个 `string`，这个设计决策背后有一个关键动机：**Claude API 的 system 参数支持传入多个 content block，每个 block 可以独立设置缓存控制参数**（`cache_control: { type: 'ephemeral' }`）。
+
+如果把所有提示词拼成一个大字符串，就无法对其中某些部分单独开启缓存。返回数组，就可以在下游的 `buildSystemPromptBlocks()` 中对每个 block 分别设置缓存策略。
+
+这是整个架构的基础：**把提示词当作有结构的数据，而不是一段字符串**。
+
+---
+
+## 二、静动态边界：跨用户全局缓存的关键
+
+`prompts.ts` 第 114 行定义了一个特殊的边界标记：
+
+```typescript
+/**
+ * Boundary marker separating static (cross-org cacheable) content from dynamic content.
+ * Everything BEFORE this marker in the system prompt array can use scope: 'global'.
+ * Everything AFTER contains user/session-specific content and should not be cached.
+ *
+ * WARNING: Do not remove or reorder this marker without updating cache logic in:
+ * - src/utils/api.ts (splitSysPromptPrefix)
+ * - src/services/api/claude.ts (buildSystemPromptBlocks)
+ */
+export const SYSTEM_PROMPT_DYNAMIC_BOUNDARY =
+  '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
+```
+
+这个边界标记把系统提示词分成两部分：
+
+```
+[静态内容]
+  getSimpleIntroSection()     ← 产品定位说明
+  getSimpleSystemSection()    ← 工具使用规则
+  getSimpleDoingTasksSection() ← 任务执行规范
+  getActionsSection()         ← 危险操作确认规则
+  getUsingYourToolsSection()  ← 工具选择指导
+  getSimpleToneAndStyleSection() ← 语气风格要求
+  getOutputEfficiencySection() ← 输出效率要求
+        ↓
+SYSTEM_PROMPT_DYNAMIC_BOUNDARY  ← 边界标记
+        ↓
+[动态内容]
+  session_guidance   ← 会话特定指导
+  memory             ← 用户记忆文件
+  env_info_simple    ← 环境信息（CWD、OS、Git 状态）
+  language           ← 语言偏好
+  mcp_instructions   ← MCP 服务器指令
+```
+
+**边界之前**的内容对所有用户都相同，可以在 API 层使用 `scope: 'global'` 缓存，跨组织共享。**边界之后**的内容包含用户和会话特定数据，不参与全局缓存。
+
+这个设计的工程价值是：假设一个 token 约 1KB 的静态前缀，每次请求都重新传输的成本非常高。通过全局缓存，Anthropic 可以让所有用户的请求复用同一份缓存的静态前缀，大幅降低成本和延迟。
+
+源码中实际插入边界的代码如下：
+
+```typescript
+return [
+  // --- 静态内容（可缓存）---
+  getSimpleIntroSection(outputStyleConfig),
+  getSimpleSystemSection(),
+  getSimpleDoingTasksSection(),
+  getActionsSection(),
+  getUsingYourToolsSection(enabledTools),
+  getSimpleToneAndStyleSection(),
+  getOutputEfficiencySection(),
+  // === 边界标记 - 禁止移动或删除 ===
+  ...(shouldUseGlobalCacheScope() ? [SYSTEM_PROMPT_DYNAMIC_BOUNDARY] : []),
+  // --- 动态内容（注册表管理）---
+  ...resolvedDynamicSections,
+].filter(s => s !== null)
+```
+
+注释 `DO NOT MOVE OR REMOVE` 并专门列出了两个需要同步更新的下游文件，这是对"隐式契约"的显式文档化——代码层面的决策要求其他地方也做出对应处理。
+
+---
+
+## 三、分段缓存：可缓存分段 vs 危险不可缓存分段
+
+动态内容也不是每次都重新计算的。`systemPromptSections.ts` 定义了两种分段类型：
+
+```typescript
+// 类型 1：普通可缓存分段
+// 计算一次，缓存到 /clear 或 /compact 为止
+export function systemPromptSection(
+  name: string,
+  compute: ComputeFn,
+): SystemPromptSection {
+  return { name, compute, cacheBreak: false }
+}
+
+// 类型 2：不可缓存分段（每轮重新计算）
+// 强制要求提供原因，说明为什么必须破坏缓存
+export function DANGEROUS_uncachedSystemPromptSection(
+  name: string,
+  compute: ComputeFn,
+  _reason: string,  // 原因参数，即使编译器不用它，人也要读它
+): SystemPromptSection {
+  return { name, compute, cacheBreak: true }
+}
+```
+
+函数名 `DANGEROUS_uncachedSystemPromptSection` 是故意设计成带 `DANGEROUS_` 前缀的——这是一种**命名即文档**的编程手法，让调用者在写下这个名字时就意识到成本。
+
+实际使用中，只有一个分段被标记为不可缓存：
+
+```typescript
+DANGEROUS_uncachedSystemPromptSection(
+  'mcp_instructions',
+  () =>
+    isMcpInstructionsDeltaEnabled()
+      ? null
+      : getMcpInstructionsSection(mcpClients),
+  'MCP servers connect/disconnect between turns',  // 必须提供原因
+),
+```
+
+其他分段，包括用户记忆、环境信息、语言偏好，都是可缓存的：
+
+```typescript
+systemPromptSection('session_guidance', () =>
+  getSessionSpecificGuidanceSection(enabledTools, skillToolCommands),
+),
+systemPromptSection('memory', () => loadMemoryPrompt()),
+systemPromptSection('env_info_simple', () =>
+  computeSimpleEnvInfo(model, additionalWorkingDirectories),
+),
+systemPromptSection('language', () =>
+  getLanguageSection(settings.language),
+),
+```
+
+解析分段时，逻辑很干净：
+
+```typescript
+export async function resolveSystemPromptSections(
+  sections: SystemPromptSection[],
+): Promise<(string | null)[]> {
+  const cache = getSystemPromptSectionCache()
+
+  return Promise.all(
+    sections.map(async s => {
+      if (!s.cacheBreak && cache.has(s.name)) {
+        return cache.get(s.name) ?? null  // 命中缓存直接返回
+      }
+      const value = await s.compute()
+      setSystemPromptSectionCacheEntry(s.name, value)
+      return value
+    }),
+  )
+}
+```
+
+这套设计把"是否需要重新计算"的决策从调用方转移到了分段定义本身，调用方只需要声明分段，不需要手动管理缓存。
+
+---
+
+## 四、工具级提示词的模块化设计
+
+Claude Code 有超过 40 个工具，每个工具都有独立的 `prompt.ts` 文件：
+
+```
+src/tools/
+├── BashTool/
+│   ├── BashTool.ts      ← 工具实现
+│   ├── prompt.ts        ← 工具提示词
+│   └── toolName.ts      ← 工具名常量
+├── FileReadTool/
+│   ├── FileReadTool.ts
+│   └── prompt.ts
+├── FileEditTool/
+│   ├── FileEditTool.ts
+│   ├── constants.ts
+│   └── prompt.ts
+...（共 40+ 个工具）
+```
+
+工具名常量通过 `prompt.ts` 导出并在主提示词中引用：
+
+```typescript
+import { FILE_WRITE_TOOL_NAME } from '../tools/FileWriteTool/prompt.js'
+import { FILE_READ_TOOL_NAME } from '../tools/FileReadTool/prompt.js'
+import { FILE_EDIT_TOOL_NAME } from '../tools/FileEditTool/constants.js'
+import { BASH_TOOL_NAME } from '../tools/BashTool/toolName.js'
+import { GLOB_TOOL_NAME } from 'src/tools/GlobTool/prompt.js'
+import { GREP_TOOL_NAME } from 'src/tools/GrepTool/prompt.js'
+```
+
+这样主提示词在引用工具名时，用的是常量而不是字符串字面量：
+
+```typescript
+function getUsingYourToolsSection(enabledTools: Set<string>): string {
+  // ...
+  return `Do NOT use the ${BASH_TOOL_NAME} to run commands when a relevant
+dedicated tool is provided. Using dedicated tools allows the user to
+better understand and review your work...`
+}
+```
+
+这个设计的好处是：如果工具改名，只需要修改 `prompt.ts` 中的常量，所有引用这个常量的提示词自动更新，不会出现提示词说 `BashTool` 但实际工具叫 `ShellTool` 的不一致问题。
+
+**提示词与代码的单一事实来源（Single Source of Truth）原则同样适用于工具命名。**
+
+---
+
+## 五、双版本提示词：内外部用户的差异化设计
+
+`prompts.ts` 中最有意思的细节之一是通过环境变量区分两套提示词：
+
+```typescript
+// 代码质量要求部分（节选）
+const codeStyleSubitems = [
+  // 所有用户都看到的通用指导
+  `Don't add features, refactor code, or make "improvements" beyond what was asked.`,
+  `Don't add error handling, fallbacks, or validation for scenarios that can't happen.`,
+  `Don't create helpers, utilities, or abstractions for one-time operations.`,
+
+  // 仅 Ant（Anthropic 内部）用户看到的额外指导
+  ...(process.env.USER_TYPE === 'ant'
+    ? [
+        // 注释写作哲学
+        `Default to writing no comments. Only add one when the WHY is non-obvious:
+a hidden constraint, a subtle invariant, a workaround for a specific bug,
+behavior that would surprise a reader.`,
+
+        // 报告诚实性要求（针对 Capy v8 模型的特定问题）
+        `Before reporting a task complete, verify it actually works: run the test,
+execute the script, check the output. Minimum complexity means no gold-plating,
+not skipping the finish line.`,
+
+        // 协作者而非执行者的定位
+        `If you notice the user's request is based on a misconception, or spot a bug
+adjacent to what they asked about, say so. You're a collaborator, not just an
+executor—users benefit from your judgment, not just your compliance.`,
+      ]
+    : []),
+]
+```
+
+不仅是代码风格，输出长度约束也是差异化的：
+
+```typescript
+// 仅 Ant 用户可见：基于数字锚点的长度限制
+// 注释说明："research shows ~1.2% output token reduction vs qualitative 'be concise'"
+...(process.env.USER_TYPE === 'ant'
+  ? [
+      systemPromptSection(
+        'numeric_length_anchors',
+        () =>
+          'Length limits: keep text between tool calls to ≤25 words. ' +
+          'Keep final responses to ≤100 words unless the task requires more detail.',
+      ),
+    ]
+  : []),
+```
+
+内部用户还有专属的调试和反馈流程，包括 `/issue`、`/share` 命令的使用指导，以及向 Slack 特定频道发送链接的工作流。
+
+更极端的是输出风格指导，内外版本完全不同：
+
+```typescript
+function getOutputEfficiencySection(): string {
+  if (process.env.USER_TYPE === 'ant') {
+    // 内部版：长达 400+ 字的详细写作指导，关注散文质量、信息密度、倒金字塔结构
+    return `# Communicating with the user
+When sending user-facing text, you're writing for a person, not logging to a console...
+[400+ 字的细致指导]`
+  }
+  // 外部版：简洁的效率导向指导
+  return `# Output efficiency
+
+IMPORTANT: Go straight to the point. Try the simplest approach first...`
+}
+```
+
+这种差异化设计反映了一个工程权衡：**内部用户是模型行为的研究者，需要更精细的指导来评估模型能力边界；外部用户需要的是稳定可靠的体验，过于复杂的指导反而会引入不确定性**。
+
+代码注释中甚至记录了具体的实验背景：
+
+```typescript
+// @[MODEL LAUNCH]: capy v8 thoroughness counterweight (PR #24302)
+// — un-gate once validated on external via A/B
+```
+
+这说明内部专属的提示词有时候是 A/B 测试的临时状态，等验证通过后会推广到外部。
+
+---
+
+## 六、极简模式与自主模式：完全不同的提示词
+
+除了内外版本的分化，Claude Code 还有几个运行模式使用了完全不同的提示词。
+
+### 6.1 极简模式（CLAUDE_CODE_SIMPLE=true）
+
+```typescript
+if (isEnvTruthy(process.env.CLAUDE_CODE_SIMPLE)) {
+  return [
+    `You are Claude Code, Anthropic's official CLI for Claude.\n\nCWD: ${getCwd()}\nDate: ${getSessionStartDate()}`,
+  ]
+}
+```
+
+正常模式下，系统提示词有数千 token；极简模式只有两行。这用于特殊场景下的最小化配置，验证模型在最少上下文下的基本行为。
+
+### 6.2 自主/主动模式（Proactive/Kairos）
+
+当启用 Proactive 或 Kairos 实验性功能时，系统提示词变成了完全不同的东西：
+
+```typescript
+if (
+  (feature('PROACTIVE') || feature('KAIROS')) &&
+  proactiveModule?.isProactiveActive()
+) {
+  return [
+    `\nYou are an autonomous agent. Use the available tools to do useful work.
+
+${CYBER_RISK_INSTRUCTION}`,
+    getSystemRemindersSection(),
+    await loadMemoryPrompt(),
+    envInfo,
+    getLanguageSection(settings.language),
+    getMcpInstructionsSection(mcpClients),
+    getScratchpadInstructions(),
+    getFunctionResultClearingSection(model),
+    SUMMARIZE_TOOL_RESULTS_SECTION,
+    getProactiveSection(),  // 包含 tick 机制和睡眠指导
+  ].filter(s => s !== null)
+}
+```
+
+正常模式下 Claude 是响应式的（用户提问，Claude 回答）；自主模式下 Claude 是主动的（通过 `<tick>` 标签定时触发，可以主动执行任务、调用 `SleepTool` 等待）。
+
+这两种截然不同的使用方式需要截然不同的系统提示词——所以它们各有独立的代码路径，而不是在同一个提示词里加条件分支。
+
+---
+
+## 七、MCP 指令增量：避免缓存失效的工程优化
+
+MCP（Model Context Protocol）服务器可以在运行时连接或断开，而 `getMcpInstructionsSection()` 会根据当前连接的服务器列表生成提示词。每次 MCP 连接状态变化，这段提示词都会改变，导致前缀缓存失效。
+
+考虑到 MCP 指令段可能有约 20K tokens，每次失效意味着重新传输 20K tokens 的成本。解决方案是增量附件机制：
+
+```typescript
+DANGEROUS_uncachedSystemPromptSection(
+  'mcp_instructions',
+  () =>
+    isMcpInstructionsDeltaEnabled()
+      ? null       // 启用增量时，通过 attachments.ts 的持久附件传递
+      : getMcpInstructionsSection(mcpClients),  // 未启用时，走传统路径
+  'MCP servers connect/disconnect between turns',
+),
+```
+
+注释解释了这个设计决策的完整背景：
+
+```typescript
+// When delta enabled, instructions are announced via persisted
+// mcp_instructions_delta attachments (attachments.ts) instead of this
+// per-turn recompute, which busts the prompt cache on late MCP connect.
+// Gate check inside compute (not selecting between section variants)
+// so a mid-session gate flip doesn't read a stale cached value.
+```
+
+**把 MCP 指令从系统提示词中移出，改为通过持久附件传递**，这样 MCP 连接/断开只更新附件，不破坏系统提示词的缓存。这是一个典型的"为了缓存效率，改变信息传递通道"的优化。
+
+---
+
+## 八、从源码学写法：如何用提示词压缩 Token 输出
+
+Claude Code 的提示词里藏着大量可以直接借鉴的"写法"，这些写法都是有实验数据或明确设计意图支撑的，不是经验主义的直觉。
+
+### 8.1 用数字锚点代替定性描述
+
+`prompts.ts` 第 529 行有一段只给内部用户的提示词，注释记录了它的来源：
+
+```typescript
+// Numeric length anchors — research shows ~1.2% output token reduction vs
+// qualitative "be concise". Ant-only to measure quality impact first.
+systemPromptSection(
+  'numeric_length_anchors',
+  () =>
+    'Length limits: keep text between tool calls to ≤25 words. ' +
+    'Keep final responses to ≤100 words unless the task requires more detail.',
+),
+```
+
+注释里说得很清楚：**数字锚点（≤25 words）比定性描述（"be concise"）减少约 1.2% 的输出 token**。
+
+1.2% 听起来不多，但在大规模部署下这是显著的成本差异。对于自己的应用，可以把模糊的语气词替换成具体数字：
+
+| 低效写法（定性描述） | 高效写法（数字锚点） |
+|---|---|
+| 请简洁回答 | 回答不超过 3 句话 |
+| 给出简短总结 | 用 50 字以内总结 |
+| 不要啰嗦 | 工具调用之间的文本不超过 20 词 |
+
+### 8.2 倒金字塔：先结论，后推理
+
+外部用户版的输出效率指导明确规定了信息顺序：
+
+```
+Lead with the answer or action, not the reasoning.
+Skip filler words, preamble, and unnecessary transitions.
+Do not restate what the user said — just do it.
+```
+
+"倒金字塔"原则（新闻写作中最重要的信息放最前面）同样适用于 AI 输出。用户的注意力从第一行开始衰减，把推理过程放在结论之前，是在用 token 消耗用户的注意力。
+
+在提示词中把这条规则写清楚：
+
+```
+先给出结论或行动，再解释原因。
+如果结论一句话能说清楚，不要用三句话。
+```
+
+### 8.3 明确列出"什么时候应该输出文本"
+
+Claude Code 的外部版不是说"少说话"，而是精确列出了值得输出文字的三种场景：
+
+```
+Focus text output on:
+- Decisions that need the user's input
+- High-level status updates at natural milestones
+- Errors or blockers that change the plan
+```
+
+这种"正向枚举"比"负向禁止"更有效。与其写 `不要输出不必要的内容`，不如写：
+
+```
+只在以下情况输出文字：
+- 需要用户做决策时
+- 到达重要里程碑时
+- 遇到阻塞或错误时
+其他情况直接执行，不要描述你在做什么。
+```
+
+### 8.4 工具调用前禁止加冒号
+
+这是一个极其具体的细节，在主提示词和子 Agent 提示词里都出现了：
+
+```typescript
+// 主提示词（Tone and style 章节）：
+`Do not use a colon before tool calls. Your tool calls may not be shown
+directly in the output, so text like "Let me read the file:" followed by
+a read tool call should just be "Let me read the file." with a period.`
+
+// 子 Agent 提示词（enhanceSystemPromptWithEnvDetails）：
+`Do not use a colon before tool calls. Text like "Let me read the file:"
+followed by a read tool call should just be "Let me read the file." with a period.`
+```
+
+冒号会让模型在工具调用前生成一段描述性铺垫，这些铺垫对用户几乎没有价值，纯粹是 token 浪费。把这条规则写进自己的提示词，可以消除大量"Let me check... / I'll now... / Here's what I'll do..." 这类模式。
+
+### 8.5 明确禁止 emoji（默认关闭，按需开启）
+
+Claude Code 在三个不同位置都写了同一条规则：
+
+```typescript
+// 主提示词
+`Only use emojis if the user explicitly requests it. Avoid using emojis in all communication unless asked.`
+
+// 子 Agent 的 notes
+`For clear communication with the user the assistant MUST avoid using emojis.`
+```
+
+emoji 对 token 计数的影响不大，但它们是"表演性"输出的信号——模型在用视觉装饰代替信息密度。把 emoji 设为默认禁止，需要时再开启，是一种有意识的"去装饰"策略。
+
+### 8.6 子 Agent 要求返回摘要，而非原始输出
+
+子 Agent 的默认系统提示词（`DEFAULT_AGENT_PROMPT`）对最终输出有明确要求：
+
+```typescript
+export const DEFAULT_AGENT_PROMPT = `You are an agent for Claude Code...
+Complete the task fully—don't gold-plate, but don't leave it half-done.
+When you complete the task, respond with a concise report covering what was done
+and any key findings — the caller will relay this to the user,
+so it only needs the essentials.`
+```
+
+关键是最后一句：**"the caller will relay this to the user, so it only needs the essentials"**。
+
+子 Agent 知道自己不是直接和用户说话，而是向调用方汇报。这个上下文提示让它天然倾向于摘要式输出，而不是把所有中间过程都写出来。
+
+在多 Agent 架构中，给子 Agent 明确告知"你的输出会被上层处理/转述"，是控制输出冗余的有效手段。
+
+### 8.7 重要信息写入响应，不要依赖工具结果
+
+这是上下文管理的一条实用规则，来自 `prompts.ts` 第 841 行：
+
+```typescript
+const SUMMARIZE_TOOL_RESULTS_SECTION =
+  `When working with tool results, write down any important information
+you might need later in your response, as the original tool result
+may be cleared later.`
+```
+
+这条提示是为了应对 **Function Result Clearing**（旧工具结果自动从上下文中清除）的机制。模型如果依赖"上下文里还有那个工具调用的结果"，在长对话中会出现幻觉或遗忘。
+
+解决方案是让模型把关键信息主动提炼进响应文本——这既是对上下文管理的适应，也能间接减少对工具结果的重复引用，降低整体 token 消耗。
+
+### 8.8 Token Budget：把消耗当目标而非限制
+
+`prompts.ts` 中有一个有趣的 Token Budget 机制：
+
+```typescript
+systemPromptSection(
+  'token_budget',
+  () =>
+    'When the user specifies a token target (e.g., "+500k", "spend 2M tokens", ' +
+    '"use 1B tokens"), your output token count will be shown each turn. ' +
+    'Keep working until you approach the target — plan your work to fill it ' +
+    'productively. The target is a hard minimum, not a suggestion. ' +
+    'If you stop early, the system will automatically continue you.',
+),
+```
+
+这个机制是反常识的：通常我们想限制 token 消耗，而这里是**把 token 消耗设为最低目标**。这用于需要模型充分展开分析的场景（如深度代码审查、大规模重构），让模型不会因为"觉得差不多了"而提前停下。
+
+这提醒我们：提示词对 token 输出的控制是**双向的**——既可以设上限压缩输出，也可以设下限强制展开。
+
+### 小结：可以直接复用的提示词写法
+
+| 技术 | 示例写法 | 效果 |
+|---|---|---|
+| 数字锚点 | `回答不超过 50 词` | 比 "简洁" 减少 ~1.2% token |
+| 倒金字塔 | `先给结论，再解释原因` | 减少铺垫性文字 |
+| 正向枚举输出场景 | `只在 X/Y/Z 情况下输出文字` | 消除大量"执行日志" |
+| 禁止工具调用前加冒号 | `工具调用前不要写描述句` | 消除 "Let me check..." 模式 |
+| 禁止 emoji | `除非用户要求，不使用 emoji` | 去除装饰性输出 |
+| 子 Agent 摘要模式 | `你的输出会被上层转述给用户，只需要关键信息` | 大幅压缩 Agent 输出量 |
+
+---
+
+## 九、提示词工程的工业级经验总结
+
+从 Claude Code 的提示词架构中，可以提炼出几条可迁移的工程经验：
+
+### 9.1 结构化优于字符串化
+
+提示词不应该是一个大字符串，而应该是可以独立管理的 content block 数组。这样才能对不同部分设置不同的缓存策略、在不同模式下替换不同部分。
+
+### 9.2 区分静态与动态，最大化缓存命中率
+
+把所有用户共享的内容放在前面，把用户/会话特定的内容放在后面，用明确的边界标记分隔。边界之前的内容可以全局缓存，大幅降低延迟和成本。
+
+### 9.3 用命名传递设计意图
+
+`DANGEROUS_uncachedSystemPromptSection` 这个名字本身就是文档。当一个设计决策有代价时，在命名上体现这个代价，让后来者在使用时就能意识到。
+
+### 9.4 工具名从代码层引用，而非字符串硬编码
+
+提示词中涉及工具名时，从工具定义文件导出常量，在提示词中引用常量。工具改名时，提示词自动同步，不会产生不一致。
+
+### 9.5 不同用户群体，不同提示词
+
+内部研究用户和外部普通用户的需求不同，可以在同一套代码中维护两套提示词内容，通过构建时或运行时条件切换。关键是保持这种差异**明确、有限、有注释说明原因**。
+
+### 9.6 记录每个设计决策的背景
+
+Claude Code 源码的注释里充满了背景信息：这个功能是哪个 PR 加的、为什么要这样而不是那样、等什么条件验证后会改掉。提示词工程尤其需要这种记录，因为修改提示词的影响往往是隐性的、全局的，没有背景信息很难判断一个改动是否安全。
+
+---
+
+## 结语
+
+Claude Code 的 `prompts.ts` 不是一个简单的"把指令写下来"的文件，而是一个有缓存策略、有版本管理、有性能预算的工程产品。
+
+它对提示词的认识是双层的：**架构层**（如何组织、缓存、分段）和**写法层**（如何措辞、锚定、控制输出量）。前者决定系统的可维护性和成本效率，后者决定模型在每一次响应中的实际表现。
+
+两层都做好，才是真正的提示词工程。
+
+从这份源码里提炼出的实践，无论是"数字锚点比定性描述减少 1.2% token"这样有数据支撑的细节，还是"工具调用前不加冒号"这样反直觉的规则，都来自 Anthropic 工程师在大规模生产环境下踩过的真实坑。把这些经验迁移到自己的 AI 应用中，是从"能用"到"好用"最直接的路径。
