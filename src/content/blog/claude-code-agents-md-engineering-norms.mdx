@@ -1,0 +1,326 @@
+---
+title: '从 AGENTS.md 看大型 TypeScript CLI 项目的工程规范'
+description: '解读 Claude Code 的 AGENTS.md，从构建工具选型、命名约定到测试哲学，看工业级 CLI 项目如何制定开发规范'
+pubDate: '2026-04-15'
+heroImage: '/blog-placeholder-2.jpg'
+---
+
+## 引言
+
+每一个成熟的开源项目背后，都有一份让协作者快速上手的开发规范文档。Claude Code 的 `AGENTS.md` 就是这样一份文档——它不像 README 那样面向用户，也不像架构设计文档那样宏大，而是专门写给**代码贡献者**看的工程手册。
+
+`AGENTS.md` 只有 33 行，但信息密度极高。本文逐段拆解其背后的工程决策，并探讨这些选择对大型 TypeScript CLI 项目意味着什么。
+
+---
+
+## 一、项目结构：模块化优先的目录设计
+
+AGENTS.md 对项目结构的描述如下：
+
+> Core source lives in `src/`. Entry points and CLI wiring are under files such as `src/dev-entry.ts`, `src/main.tsx`, and `src/commands.ts`. Feature code is grouped by area in folders like `src/commands/`, `src/services/`, `src/components/`, `src/tools/`, and `src/utils/`. Restored or compatibility code also appears in `vendor/` and local package shims in `shims/`.
+
+这一段话揭示了几个关键的结构决策：
+
+### 1.1 入口点与业务代码分离
+
+项目有多个入口点：`dev-entry.ts`、`main.tsx`、`commands.ts`。把入口文件单独列出，而不是让它们淹没在业务目录里，体现的是**启动逻辑与业务逻辑分离**的原则。
+
+```
+src/
+├── dev-entry.ts     ← 开发模式入口
+├── main.tsx         ← 主应用入口
+├── commands.ts      ← 命令注册中心
+├── commands/        ← 各命令的实现
+├── services/        ← 业务逻辑层
+├── components/      ← UI 组件层
+├── tools/           ← 原子能力层
+└── utils/           ← 公共工具函数
+```
+
+这种结构有一个明显好处：当你第一次接触项目时，你知道从哪里开始读。`main.tsx` 是应用启动点，`commands.ts` 是命令注册表——两个文件就能建立起对整个项目的初步认知。
+
+### 1.2 按"能力域"而非"技术层"组织代码
+
+`src/commands/`、`src/services/`、`src/tools/` 这样的目录划分，是按**功能域**分组，而不是按"所有 class 放一起、所有 interface 放一起"这种技术属性分组。
+
+按功能域组织的好处是**局部性**（locality）：当你要改一个功能，相关文件都在同一个目录下，不需要横跳多个技术层目录。AGENTS.md 的目录设计说明团队认同这一点。
+
+### 1.3 vendor/ 和 shims/ 的显式隔离
+
+这个细节尤其值得注意。AGENTS.md 专门提到了 `vendor/` 和 `shims/` 两个特殊目录。这不是偶然的——明确把"外部兼容代码"和"主业务代码"隔离开来，是一种**技术债务可见化**的做法。
+
+`shims/` 存放本地包垫片，`vendor/` 存放复原的兼容代码。把它们单独列目录，而不是混入 `src/`，意味着团队在说：**这里的代码是特殊处理的，改动要格外小心**。这是成熟工程团队才有的意识。
+
+---
+
+## 二、构建工具：为什么选 Bun？
+
+AGENTS.md 的第二节直接点明：
+
+> Use Bun for local development.
+
+并给出了四条命令：
+
+```bash
+bun install    # 安装依赖
+bun run dev    # 启动开发模式
+bun run start  # 同上（别名）
+bun run version # 验证 CLI 能启动并打印版本
+```
+
+### 2.1 Bun 在 CLI 工具场景的优势
+
+Bun 不只是一个包管理器，它是一个完整的 JavaScript 运行时，内置了：
+
+- **极快的安装速度**：比 npm/yarn 快 5-25 倍，依赖较多时感受明显
+- **原生 TypeScript 支持**：无需额外配置 `ts-node` 或 `tsx`，直接运行 `.ts` 文件
+- **内置测试运行器**：`bun test` 兼容 Jest API
+- **bundle API**：`bun:bundle` 提供编译时代码注入能力（Claude Code 的 `feature()` 函数就依赖这个）
+
+对于一个 TypeScript-first 的 CLI 项目来说，Bun 消除了大量工具链配置的摩擦。你不需要维护一个复杂的 `tsconfig` + `esbuild` + `ts-node` 的组合，只需要 `bun run dev` 就能启动。
+
+### 2.2 `bun run version` 的意义
+
+AGENTS.md 特别提到 `bun run version` 用于"验证 CLI 能启动并打印版本"。这个命令看起来微不足道，但背后有深意：
+
+**版本号打印是最基础的 smoke test**。如果一个 CLI 连 `--version` 都跑不通，那一定有基础性的错误（依赖缺失、TypeScript 编译失败、模块解析问题等）。把这个验证步骤显式写进开发规范，说明团队把"快速验证基础可用性"作为每次修改后的第一道关卡。
+
+```bash
+# 每次修改 TypeScript 模块后，运行对应命令验证
+bun run dev      # 验证开发流程
+bun run version  # 验证 CLI 基础启动
+```
+
+这是一种轻量级的快速反馈机制——不需要跑完整个测试套件，先验证"还能跑起来"。
+
+---
+
+## 三、代码风格：一致性高于偏好
+
+AGENTS.md 的代码风格章节是这样写的：
+
+> The codebase is TypeScript-first with ESM imports and `react-jsx`. Match the surrounding file style exactly: many files omit semicolons, use single quotes, and prefer descriptive camelCase for variables and functions, PascalCase for React components and manager classes, and kebab-case for command folders such as `src/commands/install-slack-app/`. Keep imports stable when comments warn against reordering. Prefer small, focused modules over broad utility dumps.
+
+这段话有几个值得深挖的细节：
+
+### 3.1 "Match the surrounding file style exactly"
+
+注意这句话不是"遵循我们的代码风格指南"，而是"**精确匹配周围文件的风格**"。这是一个更实用的表述。
+
+它意味着：如果你在修改一个省略分号的文件，你的新代码也必须省略分号；如果你在修改一个使用双引号的文件（尽管项目整体偏好单引号），你也应该用双引号。**局部一致性优先于全局统一**。
+
+这种做法在大型多人协作项目中非常合理——避免因为"统一风格"而产生大量无意义的格式改动，污染 git blame。
+
+### 3.2 三套命名规范并存
+
+| 场景 | 规范 | 示例 |
+|------|------|------|
+| 变量、函数 | camelCase | `parseArgs`, `sessionHistory` |
+| React 组件、Manager 类 | PascalCase | `CompanionSprite`, `SessionManager` |
+| 命令文件夹 | kebab-case | `install-slack-app`, `mock-limits` |
+
+三套规范看似复杂，实则有其合理性：文件夹名用 kebab-case 是 Unix 文件系统的惯例，也利于 CLI 命令名映射；类名用 PascalCase 是 TypeScript/JavaScript 社区的标准；函数和变量用 camelCase 是 JS 生态的普遍约定。
+
+规范来自约定，约定来自生态。遵循生态惯例的规范，是让新贡献者最快上手的方式。
+
+### 3.3 "Keep imports stable when comments warn against reordering"
+
+这个细节暗示了项目中存在**顺序敏感的导入**。通常这意味着：
+
+1. **副作用导入**：某些模块在 import 时就会执行初始化代码，顺序影响行为
+2. **循环依赖规避**：特定的导入顺序可以避免循环依赖导致的 undefined 值
+3. **Polyfill 优先**：某些 shim 必须在其他代码之前加载
+
+AGENTS.md 没有解释原因，但用"当注释警告时"这个条件句说明：这类敏感导入在代码中会有注释标注。这是一种**知识内嵌代码**（knowledge embedded in code）的做法——把"为什么不能改"的原因写在距离代码最近的地方。
+
+### 3.4 "Prefer small, focused modules over broad utility dumps"
+
+这句话是对"上帝 utils 文件"（一个装满了各种辅助函数的大文件）的明确反对。
+
+宽泛的 utility 文件有几个问题：
+- 名字无法表达意图（`utils.ts` 能告诉你什么？）
+- 随着时间推移，会变成所有人的"杂物间"
+- 难以 tree-shaking，影响构建产物大小
+
+"小而专注的模块"意味着：如果你要提取一个日期格式化函数，应该放进 `utils/date.ts`，而不是追加到 `utils/index.ts` 的末尾。
+
+---
+
+## 四、测试哲学：没有测试套件的项目如何保障质量？
+
+这是 AGENTS.md 中最有意思的部分：
+
+> There is no consolidated automated test suite configured at the repository root yet. For contributor changes, use targeted runtime checks:
+> - boot the CLI with `bun run dev`
+> - smoke-test version output with `bun run version`
+> - exercise the specific command, service, or UI path you changed
+
+以及添加测试的建议：
+
+> When adding tests, place them close to the feature they cover and name them after the module or behavior under test.
+
+### 4.1 "Yet"——一个信号词
+
+"There is no consolidated automated test suite **yet**"，这个 "yet" 非常关键。它说明这不是团队的理想状态，而是现阶段的现实。这种诚实的表述比假装没有问题要好得多。
+
+### 4.2 运行时验证的合理性
+
+没有自动化测试套件，并不意味着没有质量保障。AGENTS.md 给出的替代方案是**有针对性的运行时验证**：
+
+```
+修改了什么 → 验证什么
+────────────────────────
+TypeScript 模块   → bun run dev / bun run version
+某个命令          → 手动触发该命令
+某个 UI 路径      → 在终端界面中操作该路径
+```
+
+这种"改哪里验哪里"的策略，在项目早期或快速迭代阶段是合理的。它的成本低、反馈快，适合小团队。
+
+### 4.3 测试就近原则（Colocation）
+
+"place them close to the feature they cover"——测试文件应该和被测代码放在一起。
+
+```
+src/tools/BashTool/
+├── index.ts
+├── index.test.ts   ← 测试文件就在旁边
+└── utils.ts
+```
+
+而不是：
+
+```
+src/
+└── tools/BashTool/index.ts
+
+tests/
+└── tools/BashTool/index.test.ts  ← 远离源代码
+```
+
+测试就近放置的好处是：当你删除一个模块时，测试文件也随之删除，不会出现孤儿测试；当你阅读某个模块时，测试文件触手可及，可以作为"可执行文档"参考。
+
+---
+
+## 五、提交规范：让 PR 讲清楚"用户看到了什么变化"
+
+AGENTS.md 对提交和 PR 的要求：
+
+> Use short, imperative commit subjects, for example `Fix MCP config normalization`. Pull requests should explain the user-visible impact, note restoration-specific tradeoffs, list validation steps, and include screenshots only for TUI/UI changes.
+
+### 5.1 命令式提交信息
+
+"Short, imperative commit subjects"——提交信息用命令式动词开头，如：
+
+```
+✅ Fix MCP config normalization
+✅ Add session recovery for interrupted tasks
+✅ Remove deprecated OAuth endpoint
+
+❌ Fixed the MCP config
+❌ Changes to session recovery
+❌ Removed old code
+```
+
+命令式风格来自 Git 的惯例（Git 自动生成的 merge commit 也是命令式：`Merge branch 'feature'`）。更重要的是，它让提交历史读起来像一份**变更日志**，而不是一份**日记**。
+
+### 5.2 PR 必须说明"用户可见影响"
+
+"explain the user-visible impact"——这条要求把 PR 描述的重心从"我做了什么"转移到"用户体验了什么变化"。
+
+两者的区别：
+
+| 关注"我做了什么" | 关注"用户看到什么" |
+|-----------------|------------------|
+| 重构了 OAuth 服务层 | 登录速度提升 30%，不再出现偶发的认证失败 |
+| 修复了 parseArgs 的边界情况 | 带空格的文件路径现在可以正确传递给命令 |
+
+后者对 review 者和用户都更有价值。它迫使作者从用户视角思考自己的改动，而不是只沉浸在技术实现细节里。
+
+### 5.3 复原相关的特殊说明
+
+AGENTS.md 要求 PR 中"note restoration-specific tradeoffs"（记录复原相关的权衡）。这是这个项目特有的要求，指向了最后一节的关键背景。
+
+---
+
+## 六、复原注记：理解这个代码库的关键背景
+
+AGENTS.md 的最后一节是理解整个文档的钥匙：
+
+> This is a reconstructed source tree, not pristine upstream. Prefer minimal, auditable changes, and document any workaround added because a module was restored with fallbacks or shim behavior.
+
+### 6.1 "Reconstructed source tree"
+
+Claude Code 的这份代码库不是原始的上游代码，而是**重建的源码树**。这意味着：
+
+- 代码经过了逆向工程、分析和重写
+- 某些模块可能通过 fallback 或 shim 实现，行为与原版接近但不完全相同
+- 代码的正确性依赖于对原始行为的理解，而不仅仅是当前代码的字面含义
+
+这个背景解释了很多前面提到的设计决策：
+- 为什么有 `vendor/` 和 `shims/` 目录
+- 为什么要"保持导入顺序稳定"（顺序可能影响复原逻辑的正确性）
+- 为什么没有完整的自动化测试套件（测试套件本身也需要被复原）
+- 为什么 PR 需要说明"复原相关的权衡"
+
+### 6.2 "Minimal, auditable changes"
+
+在复原场景下，AGENTS.md 要求"最小化、可审计的改动"。这两个词背后有工程上的深意：
+
+**最小化（Minimal）**：每次改动的范围越小，出错时越容易定位问题。大规模重构在正常项目中都风险较高，在复原项目中更是如此——你不知道一个"优化"是否会改变某个依赖于特定行为的隐式约定。
+
+**可审计（Auditable）**：每个改动都应该有清晰的理由，可以追溯。在复原项目中，"我觉得这样更好"不是充分理由；"原始代码的行为是 X，这个改动是为了匹配 X"才是。
+
+### 6.3 "Document any workaround"
+
+当一个模块被用 fallback 或 shim 方式复原时，必须在代码中记录这个事实。这是知识管理的要求：
+
+```typescript
+// RESTORATION NOTE: 原版使用 Bun.hash() 计算 FNV-1a，
+// 此处使用手动实现替代，行为等价但性能略低。
+function fnv1a(input: string): number {
+  // ...
+}
+```
+
+没有这类注释，下一个维护者无法判断这段代码是"故意这样写的"还是"还没来得及实现的"。
+
+---
+
+## 七、从 AGENTS.md 提炼的工程原则
+
+回顾全文，Claude Code 的 `AGENTS.md` 体现了以下几条对大型 TypeScript CLI 项目普遍适用的工程原则：
+
+### 原则一：局部一致性优先于全局统一
+
+"精确匹配周围文件的风格"——不要为了统一而引入无意义的格式改动。
+
+### 原则二：快速反馈优先于完整验证
+
+`bun run version` 作为最基础的 smoke test，先验证"能跑起来"，再验证"跑得对"。
+
+### 原则三：小而专注的模块
+
+反对"上帝 utils 文件"，每个模块只做一件事，文件名能表达意图。
+
+### 原则四：测试就近原则
+
+测试和源代码放在一起，避免孤儿测试，让测试成为可执行文档。
+
+### 原则五：PR 从用户视角描述改动
+
+技术实现可以在 PR body 里，但标题和摘要必须说清楚用户体验了什么变化。
+
+### 原则六：技术债务显式化
+
+用 `vendor/`、`shims/` 目录，用代码注释，让特殊处理的代码显眼可见，而不是混入主流程代码中隐藏起来。
+
+---
+
+## 结语
+
+一份 33 行的 `AGENTS.md` 能告诉你很多。它不只是"怎么跑起来"的操作手册，更是团队工程文化的缩影：选什么工具、如何命名、怎么写测试、如何提交代码。
+
+最后值得思考的是：你的项目有没有一份类似的文档？它是否能让一个第一次接触项目的开发者，在 10 分钟内明白"这个项目的规则是什么"？
+
+如果没有，写一份 `AGENTS.md` 或许是今天最值得做的事。
