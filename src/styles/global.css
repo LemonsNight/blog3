@@ -63,3 +63,23 @@ body {
         background-color: var(--color-accent-950);
     }
 }
+
+/* Busuanzi 计数器样式 */
+#busuanzi_value_site_pv,
+#busuanzi_value_site_uv {
+    display: inline-block;
+    min-width: 2ch;
+    font-variant-numeric: tabular-nums;
+    transition: opacity 0.3s ease;
+}
+
+/* 加载状态动画 */
+.busuanzi-loading {
+    opacity: 0.4;
+    animation: busuanzi-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes busuanzi-pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 0.8; }
+}

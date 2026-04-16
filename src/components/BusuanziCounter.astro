@@ -1,0 +1,62 @@
+---
+interface Props {
+	type?: 'site_pv' | 'site_uv';
+	class?: string;
+}
+
+const { type = 'site_pv', class: className = '' } = Astro.props;
+
+// 映射类型到对应的 span ID
+const idMap = {
+	site_pv: 'busuanzi_value_site_pv',
+	site_uv: 'busuanzi_value_site_uv',
+};
+---
+
+<span 
+	id={idMap[type]} 
+	class={`busuanzi-loading ${className}`}
+>
+	...
+</span>
+
+<!-- Busuanzi 脚本只在客户端加载 -->
+<script is:inline>
+	if (typeof window !== 'undefined' && !document.getElementById('busuanzi')) {
+		const script = document.createElement('script');
+		script.id = 'busuanzi';
+		script.src = 'https://busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js';
+		script.async = true;
+		document.head.appendChild(script);
+		
+		// 监听数据加载完成，移除 loading 样式
+		const checkAndRemoveLoading = () => {
+			const sitePv = document.getElementById('busuanzi_value_site_pv');
+			const siteUv = document.getElementById('busuanzi_value_site_uv');
+			
+			if (sitePv && sitePv.textContent && sitePv.textContent !== '...' && !isNaN(parseInt(sitePv.textContent))) {
+				sitePv.classList.remove('busuanzi-loading');
+			}
+			if (siteUv && siteUv.textContent && siteUv.textContent !== '...' && !isNaN(parseInt(siteUv.textContent))) {
+				siteUv.classList.remove('busuanzi-loading');
+			}
+		};
+		
+		// 多次检查，确保数据加载完成
+		let checkCount = 0;
+		const checkInterval = setInterval(() => {
+			checkAndRemoveLoading();
+			checkCount++;
+			
+			// 最多检查 50 次（5秒）
+			if (checkCount > 50) {
+				clearInterval(checkInterval);
+			}
+		}, 100);
+		
+		// 脚本加载完成后立即检查
+		script.onload = () => {
+			setTimeout(checkAndRemoveLoading, 200);
+		};
+	}
+</script>
