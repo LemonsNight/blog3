@@ -9,18 +9,25 @@ export async function getStaticPaths() {
 		filterDraft: true,
 		filterUnlisted: false,
 	});
-	return posts.map((post) => ({
+	return posts.map((post, index) => ({
 		params: { slug: post.id },
-		props: post,
+		props: {
+			...post,
+			prevPost: posts[index + 1] ?? null,
+			nextPost: posts[index - 1] ?? null,
+		},
 	}));
 }
-type Props = CollectionEntry<'blog'>;
+type Props = CollectionEntry<'blog'> & {
+	prevPost: CollectionEntry<'blog'> | null;
+	nextPost: CollectionEntry<'blog'> | null;
+};
 
-const post = Astro.props;
+const { prevPost, nextPost, ...post } = Astro.props;
 const { Content } = await render(post);
 ---
 
-<BlogPost data={post.data} body={post.body}>
+<BlogPost data={post.data} body={post.body} prevPost={prevPost} nextPost={nextPost}>
 	<Content />
 	<Giscus slot="comment" />
 </BlogPost>
