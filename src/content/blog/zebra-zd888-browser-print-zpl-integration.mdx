@@ -1,0 +1,557 @@
+---
+title: 'Web 应用打印 Zebra 标签打印机：Browser Print + ZPL 完整实战'
+description: '从浏览器打印踩坑到 Zebra Browser Print + ZPL 原生方案的完整落地实践，包含坐标校准、PNG 转位图、真实定位公式推导等核心细节'
+pubDate: '2026-05-12T10:00:00+08:00'
+heroImage: '/blog-placeholder-2.jpg'
+---
+
+## 背景
+
+项目需要在 Web 端对接 **ZDesigner ZD888-300dpi ZPL** 标签打印机，给物联网设备打印二维码。纸张规格：
+
+- 碳带宽度：110mm
+- 标签纸宽：70mm
+- 每个标签：15×15mm
+- 一排 4 个标签
+- 二维码：12×12mm（居中在每个标签内）
+
+业务上要求：从 Web 页面读取一批二维码图片 URL，一次性打印成标签条。看似简单的需求，踩了一串坑才真正跑通。
+
+本文记录从 **PDF + `window.print()`** 路线失败，到 **Zebra Browser Print + ZPL 原生指令** 路线成功的完整过程，重点讲清坐标校准、位图编码这些在通用教程里找不到的细节。
+
+---
+
+## 失败的路线：浏览器原生打印
+
+### 第一次尝试：HTML + `@media print`
+
+最直觉的方案：用 HTML 布局 + CSS `@page` 控制纸张尺寸 + `window.print()`。
+
+```css
+@page {
+  size: 70mm 15mm;
+  margin: 0;
+}
+```
+
+结果一调试，问题立刻冒出来：
+
+1. **页眉页脚关闭后，打印机不触发**
+
+   Chrome 对 `@page size` 很小 + `margin: 0` + 关闭页眉页脚的组合有已知 bug，会判定"可打印区域为零"而拒绝发送打印任务。加 `margin: 0.5mm` 能绕过，但这是 hack 不是解决方案。
+
+2. **预览显示在 "Photo 4×4" 纸上**
+
+   浏览器打印预览会拿默认纸张（如 4×4 英寸相纸）来渲染你的 70×15mm 页面，导致小标签挤在左上角看似"不居中"。实际打印时，如果驱动没配置自定义纸张，也会按预设裁切。
+
+3. **位置无法精确控制**
+
+   就算预览看起来 OK，真打印出来会发现 4 个二维码对不上 4 个格子。从 HTML 的 mm 单位到打印机 300dpi 点阵，中间经过 Chrome → 系统打印驱动 → ZPL 转换，**精度完全不可控**。
+
+### 第二次尝试：jsPDF 生成 PDF 再打印
+
+既然 HTML 精度不够，直接用 jsPDF 生成指定尺寸的 PDF，在 iframe 里触发打印：
+
+```ts
+const pdf = new jsPDF({ unit: 'mm', format: [70, 15], orientation: 'landscape' });
+pdf.addImage(b64, 'PNG', qrX, qrY, 12, 12);
+const blob = pdf.output('blob');
+// 用 iframe 加载 blob URL 触发打印
+```
+
+这个方案解决了"浏览器不识别小尺寸"的问题，PDF 文件里写死了 70×15mm，但问题还在：
+
+- PDF 仍然要经过 **系统驱动 → ZPL** 这一层转换
+- 打印出来位置依然对不上，4 个二维码偏左、偏右、甚至有的被截掉
+- 打印机驱动的"缩放"和"裁切"参数难以预测
+
+**核心教训**：对于 Zebra 这类专业标签打印机，**经过浏览器 + 系统驱动的路径注定做不到毫米级精度**。
+
+---
+
+## 正确路线：Zebra Browser Print + ZPL
+
+### 方案原理
+
+```
+┌──────────────────────────────────────────────┐
+│  客户端电脑                                    │
+├──────────────────────────────────────────────┤
+│  浏览器（Vue 应用）                            │
+│   ↓ 生成 ZPL 文本                              │
+│   ↓ fetch('https://localhost:9101/write')     │
+│                                               │
+│  Zebra Browser Print（本地代理，官方免费）      │
+│   ↓ 通过 USB 发送 ZPL                          │
+│                                               │
+│  ZDesigner ZD888 打印机                        │
+│   ↓ 原生执行 ZPL 指令                          │
+│  标签纸输出 ✓                                  │
+└──────────────────────────────────────────────┘
+```
+
+**关键点**：
+
+- 前端**直接生成 ZPL 指令**（文本协议，Zebra 原生支持）
+- 不经过系统打印驱动，没有 PDF 转换
+- 打印机按 ZPL 指令逐像素绘制，**精度 = 1 / 300 英寸 = 0.085mm**
+- Zebra Browser Print 是官方提供的本地代理，前端通过 HTTP 调用
+
+### 前置条件
+
+1. **客户端电脑安装 Zebra Browser Print**（[官网下载](https://www.zebra.com/us/en/support-downloads/printer-software/by-request-software.html)）
+2. 打印机通过 USB 连接
+3. 浏览器访问 `https://localhost:9101/available` 能看到打印机列表：
+
+   ```json
+   {
+     "printer": [{
+       "deviceType": "printer",
+       "uid": "dmj242903935",
+       "name": "dmj242903935",
+       "connection": "usb",
+       "manufacturer": "Zebra Technologies"
+     }]
+   }
+   ```
+
+### API 调用流程
+
+```ts
+// 1. 获取打印机设备信息
+const availableRes = await fetch('https://localhost:9101/available');
+const available = await availableRes.json();
+const device = available.printer?.[0];
+
+// 2. 把 ZPL 文本发给代理
+const writeRes = await fetch('https://localhost:9101/write', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ device, data: zpl }),
+});
+```
+
+两个 HTTP 请求，就完成了原本需要后端服务才能做的事。
+
+---
+
+## ZPL 指令基础
+
+ZPL（Zebra Programming Language）是一种类似 PostScript 的打印控制语言，所有指令以 `^` 开头。对于本场景，真正用到的不多：
+
+| 指令 | 说明 |
+|------|------|
+| `^XA` | 开始一张标签 |
+| `^XZ` | 结束一张标签 |
+| `^PW` | 标签宽度（点） |
+| `^LL` | 标签长度（点） |
+| `^FO x,y` | 定位下一个元素的左上角（点） |
+| `^GFA,...` | 嵌入图形（单色位图） |
+| `^FS` | 字段结束 |
+
+**单位换算（300dpi 打印机）**：
+
+```
+1 inch = 25.4 mm = 300 dots
+1 mm   = 11.811 dots
+```
+
+工具函数：
+
+```ts
+const mmToDots = (mm: number): number => Math.round((mm / 25.4) * 300);
+```
+
+---
+
+## 坐标校准：从理论到现实的鸿沟
+
+### 理论计算
+
+纸张 70mm，4 个 15mm 标签均匀分布：
+
+- 总标签宽度 = 4 × 15 = 60mm
+- 剩余空间 = 10mm
+- 分配：左边距 2mm + 3 个间隙各 2mm + 右边距 2mm
+
+**标签起点（理论）**：
+
+```
+标签 1: 2mm  = 24 点
+标签 2: 19mm = 224 点
+标签 3: 36mm = 425 点
+标签 4: 53mm = 626 点
+```
+
+二维码 12mm 在 15mm 标签内居中，偏移 1.5mm = 18 点。
+
+**二维码位置（理论）**：42, 242, 443, 644
+
+发到打印机一打——**偏了**。
+
+### 现实：打印机物理偏移
+
+Zebra 打印机的"零点"不等于纸张左边缘。每个打印机、每种标签纸都可能有不同的物理偏移。理论计算无法覆盖这个差异。
+
+**真正可靠的做法**：
+
+1. 先用简单 ZPL 打一组校准图案
+2. 对比实际打印位置和标签物理位置
+3. 反推出"理论坐标 + 偏移量"的关系
+4. 把偏移量作为参数写到代码里
+
+### 校准过程
+
+用 ZPL 自带的二维码生成指令 `^BQN` 打校准图案（不需要图片，内容短）：
+
+```zpl
+^XA
+^PW826
+^LL177
+^FO42,25^BQN,2,5^FDHELLO1^FS
+^FO242,25^BQN,2,5^FDHELLO2^FS
+^FO443,25^BQN,2,5^FDHELLO3^FS
+^FO644,25^BQN,2,5^FDHELLO4^FS
+^XZ
+```
+
+根据打印结果，用尺子量：
+
+- 第一次打：整体偏左，二维码贴在标签左边缘
+- 右移 1mm → 整体偏右了
+- 左移 0.5mm → 位置刚好
+
+最终确定 **`offsetX = 1.55mm`**，**`offsetY = 0.5mm`**。
+
+### 校准的关键认知
+
+刚开始我一直想通过"精确测量纸张和标签尺寸"算出坐标。实际经验告诉我：
+
+- **理论计算给一个起点**
+- **实际打印 + 尺子测量给最终值**
+- **把偏移量做成前端参数**（offsetX/offsetY），部署到新打印机时重新校准即可
+
+这也是为什么 Zebra 官方的 Bartender、NiceLabel 这些设计软件都提供"微调"功能——硬件差异无法完全预测。
+
+---
+
+## PNG 二维码转 ZPL 位图
+
+这是另一个大坑。第一版代码直接把 PNG base64 塞进 `^GFA`：
+
+```ts
+zpl += `^FO${x},${y}`;
+zpl += `^GFA,${b64.length},,`;
+zpl += b64;   // ❌ 错误：ZPL 不认 PNG 格式
+zpl += '^FS';
+```
+
+**ZPL 的 `^GFA` 需要的是单色位图的十六进制数据**，不是 PNG。必须自己做位图转换。
+
+### 转换步骤
+
+```
+PNG URL → Canvas 渲染 → 单色阈值化 → 8 像素打 1 字节 → 十六进制字符串
+```
+
+### 核心实现
+
+```ts
+const urlToZplBitmap = (url: string, targetSize: number): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.addEventListener('load', () => {
+      // 1. 渲染到目标尺寸的 canvas
+      const canvas = document.createElement('canvas');
+      canvas.width = targetSize;
+      canvas.height = targetSize;
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, targetSize, targetSize);
+      ctx.drawImage(img, 0, 0, targetSize, targetSize);
+
+      // 2. 读取像素 → 单色阈值化 → 打包字节
+      const pixels = ctx.getImageData(0, 0, targetSize, targetSize).data;
+      const bytes: number[] = [];
+
+      for (let y = 0; y < targetSize; y++) {
+        for (let x = 0; x < targetSize; x += 8) {
+          let byte = 0;
+          for (let bit = 0; bit < 8; bit++) {
+            const px = x + bit;
+            if (px < targetSize) {
+              const idx = (y * targetSize + px) * 4;
+              const brightness =
+                ((pixels[idx] ?? 255) +
+                 (pixels[idx + 1] ?? 255) +
+                 (pixels[idx + 2] ?? 255)) / 3;
+              if (brightness < 128) {
+                byte |= 1 << (7 - bit);
+              }
+            }
+          }
+          bytes.push(byte);
+        }
+      }
+
+      // 3. 转十六进制字符串
+      const hex = bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+      resolve(hex);
+    });
+    img.addEventListener('error', () => reject(new Error(`加载图片失败: ${url}`)));
+    img.src = url;
+  });
+};
+```
+
+### ZPL 拼装
+
+有了位图十六进制数据，还要正确填 `^GFA` 参数：
+
+```
+^GFA,<total_data_bytes>,<total_graphic_bytes>,<bytes_per_row>,<hex_data>
+```
+
+- `total_data_bytes`：十六进制字符串长度
+- `total_graphic_bytes`：`bytesPerRow × height`
+- `bytes_per_row`：`Math.ceil(width / 8)`
+
+```ts
+const qrSizeDots = mmToDots(s.qrSize);          // 12mm → 142 dots
+const bytesPerRow = Math.ceil(qrSizeDots / 8);  // 18
+const totalGraphicBytes = bytesPerRow * qrSizeDots;
+
+zpl += `^FO${qrXDots},${qrYDots}`;
+zpl += `^GFA,${hexData.length},${totalGraphicBytes},${bytesPerRow},${hexData}`;
+zpl += '^FS';
+```
+
+### 为什么不用 `^GFB`（base64）
+
+ZPL 确实支持 base64 编码的图形字段（`^GFB`），但本质上它仍然要求**单色位图数据**，只是编码方式不同。PNG 文件头、调色板、压缩算法这些 ZPL 都不解析。
+
+所以不管用 `^GFA`（hex）还是 `^GFB`（base64），**前置的位图化步骤都跑不掉**。
+
+---
+
+## 完整的 ZPL 生成流程
+
+把所有环节串起来，前端生成 ZPL 的代码框架：
+
+```ts
+const generateZPL = async (bitmapList: string[]): Promise<string> => {
+  const s = settings.value;
+
+  const paperWidthDots = mmToDots(s.paperWidth);
+  const paperHeightDots = mmToDots(s.paperHeight);
+  const labelWidthDots = mmToDots(s.labelWidth);
+  const labelHeightDots = mmToDots(s.labelHeight);
+  const qrSizeDots = mmToDots(s.qrSize);
+  const offsetXDots = mmToDots(s.offsetX);
+  const offsetYDots = mmToDots(s.offsetY);
+  const columnGapDots = mmToDots(s.columnGap);
+
+  const perPage = 4;
+  const bytesPerRow = Math.ceil(qrSizeDots / 8);
+  const totalGraphicBytes = bytesPerRow * qrSizeDots;
+
+  let zpl = '^XA';
+  zpl += `^LL${paperHeightDots}`;
+  zpl += `^PW${paperWidthDots}`;
+
+  const totalPages = Math.ceil(bitmapList.length / perPage);
+  for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
+    if (pageIdx > 0) zpl += '^XZ^XA';  // 分页
+
+    const pageImgs = bitmapList.slice(
+      pageIdx * perPage,
+      pageIdx * perPage + perPage,
+    );
+
+    pageImgs.forEach((hexData, colIdx) => {
+      const labelXDots = offsetXDots + colIdx * (labelWidthDots + columnGapDots);
+      const qrXDots = labelXDots + Math.round((labelWidthDots - qrSizeDots) / 2);
+      const qrYDots = offsetYDots + Math.round((labelHeightDots - qrSizeDots) / 2);
+
+      zpl += `^FO${qrXDots},${qrYDots}`;
+      zpl += `^GFA,${hexData.length},${totalGraphicBytes},${bytesPerRow},${hexData}`;
+      zpl += '^FS';
+    });
+  }
+
+  zpl += '^XZ';
+  return zpl;
+};
+```
+
+配合发送逻辑：
+
+```ts
+const generateAndPrint = async () => {
+  const qrSizeDots = mmToDots(settings.value.qrSize);
+  const bitmapList = await Promise.all(
+    images.value.map((url) => urlToZplBitmap(url, qrSizeDots)),
+  );
+  const zpl = await generateZPL(bitmapList);
+
+  const availableRes = await fetch('https://localhost:9101/available');
+  const available = await availableRes.json();
+  const device = available.printer?.[0];
+  if (!device) throw new Error('未检测到打印机');
+
+  await fetch('https://localhost:9101/write', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device, data: zpl }),
+  });
+};
+```
+
+---
+
+## 踩坑记录
+
+### 坑 1：浏览器无法直接访问 USB 打印机
+
+**现象**：以为前端能直接打印就行，结果发现 `window.print()` 到标签打印机精度完全失控。
+
+**真相**：浏览器沙箱禁止直接访问 USB 设备（WebUSB 权限有限且需要 HTTPS + 用户授权），系统打印驱动是"黑盒"，PDF → ZPL 的转换不可控。
+
+**解法**：用 Zebra Browser Print 本地代理，或自己用 Electron/桌面应用直通 USB。
+
+---
+
+### 坑 2：以为 `^GFA` 接收 PNG base64
+
+**现象**：直接把 `canvas.toDataURL('image/png')` 的 base64 塞进 `^GFA`，打出来是乱码或全白。
+
+**真相**：ZPL 只认单色位图数据（每个像素 1 bit），不解析 PNG 格式。
+
+**解法**：自己做 PNG → Canvas → 单色阈值 → 字节打包 → 十六进制的转换链。
+
+---
+
+### 坑 3：理论坐标对不上实际打印位置
+
+**现象**：按几何计算的坐标发出去，4 个二维码偏左或偏右，总差那么 1-2mm。
+
+**真相**：打印机的"零点"不等于纸张左边缘，每台机器、每批标签纸都可能有物理偏移。
+
+**解法**：把 `offsetX` / `offsetY` 做成可调参数，通过校准 ZPL + 尺子测量来确定具体值。
+
+---
+
+### 坑 4：端口搞错（9100 vs 9101）
+
+**现象**：`POST http://localhost:9100` 一直连不上。
+
+**真相**：9100 是**网络打印机的 RAW TCP 端口**（Zebra 网络打印机有自己的 IP + 9100 端口）。Zebra **Browser Print** 的默认 HTTPS 端口是 **9101**。
+
+**解法**：用 `https://localhost:9101`，首次访问时需要在浏览器手动接受自签名证书。
+
+---
+
+### 坑 5：API 路径和请求体格式
+
+**现象**：直接 POST ZPL 到根路径 `https://localhost:9101/`，提示 404 或请求被忽略。
+
+**真相**：正确的 API 路径是 `/write`，请求体必须是 JSON：
+
+```json
+{
+  "device": { "uid": "...", "connection": "usb", ... },
+  "data": "^XA...^XZ"
+}
+```
+
+必须先通过 `/available` 拿到完整的 device 对象，不能自己拼。
+
+---
+
+### 坑 6：舍入误差导致坐标差 1 点
+
+**现象**：`offsetX = 3mm` 对应的坐标比校准值少 1 点。
+
+**真相**：`3 / 25.4 * 300 = 35.43`，`Math.round` 后得到 35，但校准值需要 36。
+
+**解法**：精细化配置 `offsetX = 3.05mm`，`Math.round(3.05 / 25.4 * 300) = 36` ✓。
+
+---
+
+## 设计决策
+
+### 为什么不用后端生成 ZPL
+
+初期考虑过后端方案：前端把参数和图片 URL 发给后端，后端用 Java/Python 的 ZPL 库生成指令并通过网络发给打印机。
+
+**放弃的原因**：
+
+- 本项目是固定工位机打印，**打印机不在机房，在客户端旁边**
+- USB 连接的打印机后端够不着
+- 走后端反而要多做一个"后端 → 客户端本地代理 → 打印机"的中转
+
+**Browser Print 方案的优势**：
+
+- 零后端开发成本
+- 数据不离开客户端（二维码 URL 不上传到服务器）
+- 部署成本 = 客户端装一次代理 + 浏览器打开网页
+
+### 为什么不用 WebUSB
+
+浏览器 WebUSB API 理论上可以直接访问打印机，但：
+
+1. 需要 HTTPS
+2. 每次使用都要弹出用户授权（体验差）
+3. 需要手写 USB 通信协议（Zebra 的 USB 协议远比 ZPL 复杂）
+4. Safari 和一些企业浏览器不支持
+
+Browser Print 把这些都屏蔽了，对业务代码来说打印机就是一个 `fetch` 能命中的 HTTP 服务。
+
+### 校准参数作为产品配置
+
+最终代码里有 8 个参数暴露给用户：
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| paperWidth | 70mm | 标签纸宽 |
+| paperHeight | 15mm | 标签纸高 |
+| labelWidth | 15mm | 单个标签宽 |
+| labelHeight | 15mm | 单个标签高 |
+| qrSize | 12mm | 二维码实际打印尺寸 |
+| columnGap | 2mm | 标签间距 |
+| offsetX | 1.55mm | 水平偏移（校准用） |
+| offsetY | 0.5mm | 垂直偏移（校准用） |
+
+不同的打印机、不同的标签批次，`offsetX` / `offsetY` 可能需要重新调，其他参数一般不变。这套参数化 + 弹窗交互让**部署到新环境时不用改代码**。
+
+---
+
+## 关键认知总结
+
+1. **Web 打专业标签机 ≠ Web 打 A4 办公机**
+   - A4 办公机：HTML + CSS + `window.print()` 足够
+   - 标签机（Zebra、兄弟、爱普生 TM 系列）：必须用原生指令协议
+
+2. **`@page` + `window.print()` 达不到毫米级精度**
+   - 不是 `@page` 不够强，是"浏览器 → 系统驱动 → 打印机"这条链路上的每一层都会做自己的调整
+
+3. **ZPL 的位图字段不接受图片格式**
+   - `^GFA` 只认单色位图二进制数据
+   - 必须前端自己做 PNG → 单色位图的转换
+
+4. **真实打印机有物理偏移，校准不可省**
+   - 理论坐标是起点，尺子测量是终点
+   - 把偏移量做成配置参数，不要硬编码
+
+5. **Browser Print 是"零成本的本地打印服务"**
+   - 官方免费、装一次就行、API 简单（两个 HTTP 请求）
+   - 适合**固定工位**场景，不适合"任意电脑随意打印"
+
+---
+
+## 相关链接
+
+- [Zebra Browser Print 下载](https://www.zebra.com/us/en/support-downloads/printer-software/by-request-software.html)
+- [ZPL 指令参考手册](https://www.zebra.com/content/dam/zebra/manuals/printers/common/programming/zpl-zbi2-pm-en.pdf)
+- [Zebra Setup Utilities](https://www.zebra.com/us/en/support-downloads/printer-software/printer-setup-utilities.html)（用于校准 ZPL 测试）
