@@ -1,0 +1,315 @@
+---
+title: 'Pake-CLI 实战：一键将 Web 应用打包为桌面 exe'
+description: '从零开始使用 Pake-CLI 将 Vue3 / Vben Admin 后台管理系统打包为 Windows 独立可执行文件，含环境配置、路径修复、调试模式与踩坑实录'
+pubDate: '2026-06-11T22:00:00+08:00'
+heroImage: '/blog-placeholder-4.jpg'
+---
+
+## 引言
+
+如果你有一个 Web 后台管理系统，想把它变成双击就能运行的桌面应用——你会怎么做？
+
+传统方案是 Electron，但打包后的体积动辄 100MB+，内存占用也不够友好。另一个方案是 **Pake**：它基于 Rust + Tauri，用系统自带的 WebView 渲染页面，生成的 exe 只有 10~15MB，内存占用远低于 Electron。
+
+本文以实际项目为例，完整演示 Pake-CLI 的使用流程、关键配置和常见问题。
+
+---
+
+## 一、Pake 是什么
+
+Pake（<https://github.com/tw93/Pake>）是一个命令行工具，核心理念是"把任意网页变成桌面应用"：
+
+- 基于 **Tauri v2**（Rust + WebView2）
+- 打包产物 **10~15MB**（Electron 同等应用 100MB+）
+- 内存占用约 Electron 的 **1/3 ~ 1/2**
+- 支持 Windows / macOS / Linux 三平台
+
+安装方式：
+
+```bash
+# npm 全局安装
+npm install -g pake-cli
+
+# 验证
+pake --version  # 3.11.8
+```
+
+---
+
+## 二、快速上手：打包一个网页
+
+### 最基本用法
+
+```bash
+pake https://example.com --name "我的应用"
+```
+
+Pake 会下载网页内容，编译 Tauri 项目，输出一个可执行文件。
+
+但这只适用于简单网页。对于 SPA（单页应用）或需要 API 接口的后台系统，需要更多配置。
+
+---
+
+## 三、实战：打包 Vue3 后台管理系统
+
+我们的项目是一个 Vben Admin v5 的后台系统（Vue 3 + Element Plus + Vite），构建产物在 `dist/` 目录下。
+
+### 3.1 环境配置
+
+首先为桌面打包创建独立的环境变量文件 `.env.pake`：
+
+```bash
+# .env.pake —— pake 桌面打包专用
+VITE_GLOB_API_URL=https://your-api-domain.com/
+
+# 使用相对路径，适配 file:// 协议
+VITE_BASE=./
+
+# hash 路由模式
+VITE_ROUTER_HISTORY=hash
+
+VITE_COMPRESS=none
+VITE_PWA=false
+VITE_INJECT_APP_LOADING=true
+VITE_ARCHIVER=false
+```
+
+关键点说明：
+
+| 变量 | 值 | 原因 |
+|------|-----|------|
+| `VITE_GLOB_API_URL` | 固定 API 域名 | pake 运行在 `file://` 协议下，无法使用同域名 `/api` 代理 |
+| `VITE_BASE` | `./` | 构建产物使用相对路径，适配本地文件协议 |
+| `VITE_ROUTER_HISTORY` | `hash` | history 模式需要服务端路由支持，本地文件无法使用 |
+
+然后在 `package.json` 添加构建脚本：
+
+```json
+{
+  "scripts": {
+    "build:pake": "pnpm vite build --mode pake"
+  }
+}
+```
+
+构建：
+
+```bash
+cd apps/web-ele
+pnpm run build:pake
+# 输出在 dist/
+```
+
+### 3.2 修复资源路径
+
+构建产物的 index.html 中，资源路径默认是绝对路径：
+
+```html
+<!-- 默认生产构建 -->
+<script src="/_app.config.js"></script>
+<script src="/jse/index-xxx.js"></script>
+```
+
+这些路径在 `file://` 协议下无法正确加载。`VITE_BASE=./` 让 Vite 输出相对路径：
+
+```html
+<!-- pake 构建 -->
+<script src="./_app.config.js"></script>
+<script src="./jse/index-xxx.js"></script>
+```
+
+### 3.3 打包命令
+
+```bash
+cd /d D:\app\web\sy\xinzhou
+pake apps/web-ele/dist/index.html ^
+  --name "鑫舟江领智慧一体化运营管理系统" ^
+  --icon apps/web-ele/dist/favicon.ico ^
+  --width 1440 ^
+  --height 960 ^
+  --use-local-file ^
+  --inject inject-fix.js
+```
+
+各参数说明：
+
+| 参数 | 作用 |
+|------|------|
+| `url` | 入口 HTML 路径（本地文件） |
+| `--name` | 应用窗口标题和 exe 文件名 |
+| `--icon` | 应用图标 |
+| `--width / --height` | 窗口默认尺寸 |
+| `--use-local-file` | **必选** — 使用本地文件而非远程 URL |
+| `--inject` | 注入 CSS/JS 文件（可选） |
+
+### 3.4 Inject 脚本：兜底修复
+
+`--inject` 参数可以在页面加载时注入 JS/CSS。我们用它来做两件事：
+
+```js
+// inject-fix.js
+(function() {
+  // 1. 修复 base URL（兜底）
+  var base = document.querySelector('base');
+  if (!base) {
+    var el = document.createElement('base');
+    var path = location.href.substring(0, location.href.lastIndexOf('/') + 1);
+    el.href = path;
+    document.head.prepend(el);
+  }
+
+  // 2. 动态覆盖 API 配置（可选）
+  // 如果 .env.pake 已配置好，这段不是必需的
+  // 但作为兜底方案可以有效防止配置遗漏
+  if (!window._VBEN_ADMIN_PRO_APP_CONF_) {
+    Object.defineProperty(window, '_VBEN_ADMIN_PRO_APP_CONF_', {
+      value: { VITE_GLOB_API_URL: 'https://your-api-domain.com/' },
+      writable: false,
+      configurable: false,
+    });
+  }
+})();
+```
+
+> **注意**：inject 文件必须是纯 `.js` 或 `.css` 格式，不要带 `<script>` 标签包裹。
+
+### 3.5 提取产物
+
+编译完成后（约 1~2 分钟），exe 位于：
+
+```bash
+# 默认路径
+pake-cli/src-tauri/target/x86_64-pc-windows-msvc/release/pake-应用名.exe
+
+# 复制到项目根目录
+copy /y "path\to\pake-\*.exe" .
+```
+
+Release 版 exe 约 **12.7 MB**，独立运行，无需附带 dist 目录（Tauri 已内嵌前端资源）。
+
+---
+
+## 四、调试模式：按 F12 打开 DevTools
+
+WebView 中的网络异常、控制台报错、接口返回数据，怎么调试？
+
+Pake 提供了 `--debug` 参数：
+
+```bash
+pake apps/web-ele/dist/index.html ^
+  --name "应用名" ^
+  --use-local-file --debug ^
+  --inject inject-fix.js
+```
+
+加上 `--debug` 后：
+
+- 使用 dev profile 编译（带调试符号，exe 约 36MB）
+- 运行时按 **F12** 或 **Ctrl+Shift+I** 打开 Chromium DevTools
+- 可在 Console、Network、Sources 面板排查问题
+- 启用 verbose 日志，构建过程会输出详细编译信息
+
+> **排查完问题后**，建议用 release 版本（不加 `--debug`），体积更小、性能更好。
+
+---
+
+## 五、完整工作流
+
+```bash
+# 1. 构建前端（pake 环境）
+cd apps/web-ele
+pnpm run build:pake
+
+# 2. 打包桌面应用
+cd /d D:\app\web\sy\xinzhou
+pake apps/web-ele/dist/index.html ^
+  --name "鑫舟江领智慧一体化运营管理系统" ^
+  --icon apps/web-ele/dist/favicon.ico ^
+  --width 1440 --height 960 ^
+  --use-local-file ^
+  --inject apps/web-ele/inject-fix.js
+
+# 3. 提取 exe
+copy /y "D:\app\web\nvm\nvm\v24.14.1\node_modules\pake-cli\src-tauri\target\x86_64-pc-windows-msvc\release\*.exe" .
+```
+
+> **小技巧**：pake-cli 安装在 `node_modules/pake-cli` 下，可以在其中找到 exe 输出路径。不同 Node 版本管理工具（nvm / fnm）下路径可能不同，用 `where pake` 查看实际路径。
+
+---
+
+## 六、踩坑与解决方案
+
+### 6.1 WiX 中文编码问题
+
+**现象**：
+
+```
+error LGHT0311: A string was provided with characters that are not available
+in the specified database code page '1252'.
+```
+
+**原因**：Pake 生成的 MSI 安装包包含中文产品名，但 WiX 工具的默认代码页 `1252` 不支持中文字符。
+
+**影响**：只影响 `.msi` 安装包的生成。exe 文件不受影响，可直接双击运行。
+
+**解决方案**：忽略 MSI 打包报错，直接使用生成的 exe 文件。
+
+### 6.2 `--use-local-file` 时资源加载失败
+
+**现象**：应用打开后白屏，DevTools 中看到资源 404。
+
+**原因**：Vite 默认使用绝对路径（`/js/app.js`），在 `file://` 协议下无法正确解析。
+
+**解决方案**：设置 `VITE_BASE=./` 让构建产物使用相对路径，同时配合 inject 脚本兜底修复。
+
+### 6.3 请求 file:// 协议的 API
+
+**现象**：接口调用时 URL 为 `file:///api/xxx`，请求失败。
+
+**原因**：`VITE_GLOB_API_URL` 为空时，框架使用 `location.origin` 作为 API 基地址，在本地文件中为 `file://`。
+
+**解决方案**：设置 `VITE_GLOB_API_URL=https://your-api-domain.com/`，并在 `_app.config.js` 中验证值是否正确。
+
+### 6.4 首次编译慢
+
+**现象**：第一次运行 pake 耗时 10~15 分钟。
+
+**原因**：需要下载 Rust 工具链、编译所有 Tauri 依赖 crate。
+
+**解决方案**：首次编译是正常的，之后增量编译只需 1~2 分钟。保持 cargo 缓存（`~/.cargo`）即可。
+
+---
+
+## 七、与 Electron 的对比
+
+| 维度 | Pake (Tauri) | Electron |
+|------|-------------|----------|
+| 打包体积 | 10~15 MB | 100~200 MB |
+| 内存占用 | ~60 MB | ~180 MB |
+| 运行时 | 系统 WebView2 | 内置 Chromium |
+| 开发语言 | Rust + JS | Node.js + JS |
+| 安装包支持 | MSI / NSIS / DMG | NSIS / DMG / AppImage |
+| 中文支持 | MSI 中文名有坑 | 正常 |
+
+---
+
+## 八、总结
+
+Pake-CLI 提供了一种轻量级的 Web 应用桌面化方案。通过 `--use-local-file` + `VITE_BASE=./` + `VITE_GLOB_API_URL` 的配合，可以将任意 Vue / React 后台系统打包为 12MB 左右的独立 exe。
+
+核心要点：
+
+1. **环境隔离**：为桌面打包创建独立的 `.env.pake` 环境配置
+2. **相对路径**：`VITE_BASE=./` 确保资源在 `file://` 协议下可加载
+3. **固定 API**：显式设置 API 域名，避免 `file://` 协议下网络请求失败
+4. **Inject 兜底**：用 `--inject` 注入修复脚本，处理异常情况
+5. **Debug 模式**：加 `--debug` 后 F12 可打开 DevTools
+
+---
+
+## 参考资料
+
+- [Pake GitHub](https://github.com/tw93/Pake) — 项目源码与文档
+- [Tauri v2 Documentation](https://v2.tauri.app/) — 底层框架文档
+- [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) — Windows WebView2 运行时
+- [Vben Admin](https://vben.pro/) — 本文实战项目的前端框架

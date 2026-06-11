@@ -3,7 +3,17 @@
     "allow": [
       "Bash(wc:*)",
       "WebSearch",
-      "WebFetch(domain:dev.to)"
+      "WebFetch(domain:dev.to)",
+      "Bash(xargs grep:*)",
+      "Bash(grep -E \"\\\\.\\(astro|tsx|ts|jsx|js\\)$\")",
+      "Read(//mnt/d/app/web/github/**)",
+      "Bash(node -e \":*)",
+      "WebFetch(domain:docs.astro.build)",
+      "Bash(node -e \"const b = ''''; console.log\\(''empty string:'', JSON.stringify\\(b\\), ''length:'', b.length\\)\")",
+      "WebFetch(domain:www.nxcode.io)",
+      "WebFetch(domain:dev.classmethod.jp)",
+      "WebFetch(domain:www.jdhodges.com)",
+      "WebFetch(domain:claudelog.com)"
     ]
   }
 }
