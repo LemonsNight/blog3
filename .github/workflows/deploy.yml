@@ -7,9 +7,6 @@ on:
     branches: [master]
   # Allows you to run this workflow manually from the Actions tab on GitHub.
   workflow_dispatch:
-# 全局开启Action强制Node24运行时
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 # Allow this job to clone the repo and create a page deployment
 permissions:
   contents: read
@@ -19,6 +16,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout your repository using git
         uses: actions/checkout@v4
