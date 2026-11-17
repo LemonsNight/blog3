@@ -5,12 +5,13 @@ interface Props {
     avatarUrl?: string
     name: string
     description?: string
+    detail?: string
 }
 
-const { tagName: LinkWrapper = "li", url, avatarUrl, name, description } = Astro.props;
+const { tagName: LinkWrapper = "li", url, avatarUrl, name, description, detail } = Astro.props;
 ---
 
-<LinkWrapper>
+<LinkWrapper class="group relative">
     <a target="_blank" href={url} class="grid grid-cols-[4rem_1fr] grid-rows-[2rem_2rem] gap-[0_1.25rem] text-inherit no-underline text-primary-500 dark:text-primary-500 transition-colors hover:no-underline hover:text-primary-300 dark:hover:text-primary-300">
         <div class="row-[span_2]">
             {avatarUrl ? (
@@ -22,4 +23,10 @@ const { tagName: LinkWrapper = "li", url, avatarUrl, name, description } = Astro
         <p class="text-xl leading-[2rem] overflow-hidden text-ellipsis whitespace-nowrap m-0">{name}</p>
         <aside class="text-base leading-[2rem] text-black dark:text-white opacity-60 overflow-hidden text-ellipsis whitespace-nowrap">{description}</aside>
     </a>
+    {detail && (
+        <div role="tooltip" class="pointer-events-none absolute bottom-full left-0 z-10 mb-2 w-72 max-w-[85vw] rounded-xl border border-black/10 bg-white p-3 text-sm leading-relaxed text-black opacity-0 shadow-lg transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 dark:border-white/15 dark:bg-neutral-800 dark:text-white">
+            <span aria-hidden="true" class="absolute left-6 top-full -mt-1.5 block size-3 rotate-45 border-b border-r border-black/10 bg-white dark:border-white/15 dark:bg-neutral-800"></span>
+            {detail}
+        </div>
+    )}
 </LinkWrapper>
