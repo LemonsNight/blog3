@@ -7,6 +7,8 @@ import MarkdownBody from "../../components/MarkdownBody.astro";
 import Giscus from "../../components/Giscus.astro";
 
 import * as markdownData from "./_links.md";
+
+const factorCalculatorAvatar = `${import.meta.env.BASE_URL}uma-factor-calculator.webp`;
 ---
 
 <BlogPage title="链接" description="来看看我的小伙伴们吧！">
@@ -15,7 +17,7 @@ import * as markdownData from "./_links.md";
         <Friend name="赛马娘赛道模拟" description="日服的赛道技能测试" url="https://mee1080.github.io/umasim/race/" avatarUrl="https://ts1.tc.mm.bing.net/th/id/OIP-C.STLjGynesZLeXWWVbV8vrgHaKe?w=108&h=108&c=1&bgcl=b0c5b9&r=0&o=7&dpr=1.5&pid=ImgRC&rm=3"></Friend>
         <Friend name="繁中赛道模拟器" description="繁中版赛道技能测试" url="https://lemonsnight.github.io/umasim/race/" avatarUrl="https://ts1.tc.mm.bing.net/th/id/OIP-C.STLjGynesZLeXWWVbV8vrgHaKe?w=108&h=108&c=1&bgcl=b0c5b9&r=0&o=7&dpr=1.5&pid=ImgRC&rm=3"></Friend>
         <Friend url="https://www.umafriends.com/" name="马娘友人帐" description="种马DB" avatarUrl="https://ts4.tc.mm.bing.net/th/id/OIP-C.S9Lqi5gHwwWqEl5lo1wHDQHaNJ?w=128&h=108&c=7&qlt=90&bgcl=b6f829&r=0&o=6&dpr=1.5&pid=13.1" />
-        <Friend url="https://lemonsnight.github.io/uma-factor-calculator" name="赛马娘因子计算器" description="Uma Musume Factor Calculator" avatarUrl="/uma-factor-calculator.webp" />
+        <Friend url="https://lemonsnight.github.io/uma-factor-calculator" name="赛马娘因子计算器" description="Uma Musume Factor Calculator" avatarUrl={factorCalculatorAvatar} />
         <Friend url="https://gametora.com/zh-tw/umamusume" name="赛马娘资料查询" description="百科" avatarUrl="https://ts1.tc.mm.bing.net/th/id/OIP-C.XjraiZwOpFHiRmqXIbjqIwHaJ4?w=108&h=108&c=1&bgcl=610bda&r=0&o=7&dpr=1.5&pid=ImgRC&rm=3" />
         <Friend
             url="https://umamusumedb.com"
